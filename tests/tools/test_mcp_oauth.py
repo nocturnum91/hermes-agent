@@ -510,7 +510,7 @@ def test_build_oauth_auth_preserves_server_url_path():
             captured.update(kwargs)
 
     with patch.object(mcp_oauth, "_OAUTH_AVAILABLE", True), \
-         patch.object(mcp_oauth, "OAuthClientProvider", _FakeProvider), \
+         patch.object(mcp_oauth, "_HermesOAuthProvider", _FakeProvider), \
          patch.object(mcp_oauth, "_is_interactive", return_value=True), \
          patch.object(mcp_oauth, "_maybe_preregister_client"), \
          patch.object(mcp_oauth, "HermesTokenStorage") as mock_storage_cls:

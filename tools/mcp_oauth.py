@@ -59,6 +59,7 @@ try:
     from mcp.shared.auth import (
         OAuthClientInformationFull,
         OAuthClientMetadata,
+        OAuthMetadata,
         OAuthToken,
     )
     from pydantic import AnyUrl
@@ -191,6 +192,9 @@ class HermesTokenStorage:
     def _client_info_path(self) -> Path:
         return _get_token_dir() / f"{self._server_name}.client.json"
 
+    def _meta_path(self) -> Path:
+        return _get_token_dir() / f"{self._server_name}.meta.json"
+
     # -- tokens ------------------------------------------------------------
 
     async def get_tokens(self) -> "OAuthToken | None":
@@ -268,11 +272,30 @@ class HermesTokenStorage:
         _write_json(self._client_info_path(), client_info.model_dump(mode="json", exclude_none=True))
         logger.debug("OAuth client info saved for %s", self._server_name)
 
+    # -- oauth server metadata --------------------------------------------
+    # The MCP SDK keeps discovered ``OAuthMetadata`` (token endpoint URL
+    # etc.) in memory only. Persisting it here lets a restarted process
+    # refresh tokens without re-running the browser-based discovery.
+
+    def save_oauth_metadata(self, metadata: "OAuthMetadata") -> None:
+        _write_json(self._meta_path(), metadata.model_dump(exclude_none=True, mode="json"))
+        logger.debug("OAuth metadata saved for %s", self._server_name)
+
+    def load_oauth_metadata(self) -> "OAuthMetadata | None":
+        data = _read_json(self._meta_path())
+        if data is None:
+            return None
+        try:
+            return OAuthMetadata.model_validate(data)
+        except (ValueError, TypeError, KeyError) as exc:
+            logger.warning("Corrupt OAuth metadata at %s -- ignoring: %s", self._meta_path(), exc)
+            return None
+
     # -- cleanup -----------------------------------------------------------
 
     def remove(self) -> None:
         """Delete all stored OAuth state for this server."""
-        for p in (self._tokens_path(), self._client_info_path()):
+        for p in (self._tokens_path(), self._client_info_path(), self._meta_path()):
             p.unlink(missing_ok=True)
 
     def has_cached_tokens(self) -> bool:
@@ -414,6 +437,143 @@ async def _wait_for_callback() -> tuple[str, str | None]:
         )
 
     return result["auth_code"], result["state"]
+
+
+# ---------------------------------------------------------------------------
+# OAuth provider subclass -- restores & persists OAuth server metadata
+# ---------------------------------------------------------------------------
+
+if _OAUTH_AVAILABLE:
+
+    class _HermesOAuthProvider(OAuthClientProvider):
+        """OAuthClientProvider subclass that restores and persists OAuth
+        server metadata (``token_endpoint`` etc.) across process restarts.
+
+        The MCP SDK keeps ``oauth_metadata`` in memory only. Without disk
+        persistence, a restart causes refresh requests to POST to a guessed
+        ``/token`` path, which returns 404 on most OAuth providers and
+        forces a full browser re-authorization.
+
+        Token expiry persistence is handled separately in
+        ``HermesTokenStorage.get_tokens()`` via ``expires_in`` rewriting.
+        """
+
+        async def _initialize(self) -> None:
+            await super()._initialize()
+            storage = self.context.storage
+            if not isinstance(storage, HermesTokenStorage):
+                return
+
+            # Restore metadata from disk
+            if not self.context.oauth_metadata:
+                meta = storage.load_oauth_metadata()
+                if meta:
+                    self.context.oauth_metadata = meta
+                    logger.debug(
+                        "OAuth[%s] restored metadata from disk (token_endpoint=%s)",
+                        storage._server_name,
+                        meta.token_endpoint,
+                    )
+
+            # Discover via well-known endpoints if we still have no metadata
+            # but have a refresh token we'll need to use
+            if (
+                not self.context.oauth_metadata
+                and self.context.current_tokens
+                and self.context.current_tokens.refresh_token
+            ):
+                import asyncio as _asyncio
+                try:
+                    await _asyncio.wait_for(
+                        self._discover_oauth_metadata(storage._server_name),
+                        timeout=10.0,
+                    )
+                except _asyncio.TimeoutError:
+                    logger.warning(
+                        "OAuth[%s] metadata discovery timed out", storage._server_name
+                    )
+
+        async def _discover_oauth_metadata(self, server_name: str) -> None:
+            """Discover OAuth metadata via well-known endpoints and persist it."""
+            import httpx as _httpx
+            from mcp.client.auth.utils import (
+                build_oauth_authorization_server_metadata_discovery_urls,
+                build_protected_resource_metadata_discovery_urls,
+            )
+            from mcp.shared.auth import OAuthMetadata as _OAuthMeta
+            from mcp.shared.auth import ProtectedResourceMetadata as _PRM
+
+            server_url = self.context.server_url
+            try:
+                async with _httpx.AsyncClient(timeout=5.0) as client:
+                    # Protected Resource Metadata -> auth server URL
+                    auth_server_url = None
+                    for url in build_protected_resource_metadata_discovery_urls(
+                        None, server_url
+                    ):
+                        resp = await client.get(str(url))
+                        if resp.status_code == 200:
+                            try:
+                                prm = _PRM.model_validate_json(resp.content)
+                                self.context.protected_resource_metadata = prm
+                                if prm.authorization_servers:
+                                    auth_server_url = str(prm.authorization_servers[0])
+                                break
+                            except Exception:
+                                continue
+
+                    # Authorization Server Metadata -> token endpoint etc.
+                    for url in build_oauth_authorization_server_metadata_discovery_urls(
+                        auth_server_url, server_url
+                    ):
+                        resp = await client.get(str(url))
+                        if resp.status_code == 200:
+                            try:
+                                meta = _OAuthMeta.model_validate_json(resp.content)
+                                self.context.oauth_metadata = meta
+                                storage = self.context.storage
+                                if isinstance(storage, HermesTokenStorage):
+                                    storage.save_oauth_metadata(meta)
+                                logger.debug(
+                                    "OAuth[%s] discovered metadata (token_endpoint=%s)",
+                                    server_name,
+                                    meta.token_endpoint,
+                                )
+                                break
+                            except Exception:
+                                continue
+            except Exception as exc:
+                logger.warning(
+                    "OAuth[%s] metadata discovery failed: %s", server_name, exc
+                )
+
+        async def async_auth_flow(self, request):
+            """Wrap parent auth flow to persist metadata after initial discovery.
+
+            The MCP SDK discovers ``oauth_metadata`` during the 401 auth flow
+            but never writes it to disk. After the parent flow exits we
+            snapshot the metadata so a subsequent process can skip discovery.
+            """
+            flow = super().async_auth_flow(request)
+            response = None
+            try:
+                while True:
+                    if response is None:
+                        out_request = await flow.__anext__()
+                    else:
+                        out_request = await flow.asend(response)
+                    response = yield out_request
+            except StopAsyncIteration:
+                pass
+
+            storage = self.context.storage
+            if isinstance(storage, HermesTokenStorage) and self.context.oauth_metadata:
+                existing = storage.load_oauth_metadata()
+                if (
+                    not existing
+                    or existing.token_endpoint != self.context.oauth_metadata.token_endpoint
+                ):
+                    storage.save_oauth_metadata(self.context.oauth_metadata)
 
 
 # ---------------------------------------------------------------------------
@@ -563,7 +723,7 @@ def build_oauth_auth(
     client_metadata = _build_client_metadata(cfg)
     _maybe_preregister_client(storage, cfg, client_metadata)
 
-    return OAuthClientProvider(
+    return _HermesOAuthProvider(
         server_url=server_url,
         client_metadata=client_metadata,
         storage=storage,
