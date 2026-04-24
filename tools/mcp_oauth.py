@@ -82,9 +82,12 @@ class OAuthNonInteractiveError(RuntimeError):
 # Module-level state
 # ---------------------------------------------------------------------------
 
-# Port used by the most recent build_oauth_auth() call.  Exposed so that
-# tests can verify the callback server and the redirect_uri share a port.
+# Port/host used by the most recent build_oauth_auth() call. Exposed so that
+# tests can verify the callback server and the redirect_uri share the same
+# listener settings.
 _oauth_port: int | None = None
+_oauth_bind_host: str = "127.0.0.1"
+_oauth_result: dict[str, str | None] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -381,9 +384,9 @@ async def _redirect_handler(authorization_url: str) -> None:
 async def _wait_for_callback() -> tuple[str, str | None]:
     """Wait for the OAuth callback to arrive on the local callback server.
 
-    Uses the module-level ``_oauth_port`` which is set by ``build_oauth_auth``
-    before this is ever called.  Polls for the result without blocking the
-    event loop.
+    Uses the module-level listener settings prepared by ``build_oauth_auth``.
+    If a callback server is already running on that port, we reuse the shared
+    result container instead of failing on a second bind attempt.
 
     Raises:
         OAuthNonInteractiveError: If the callback times out (no user present
@@ -398,35 +401,42 @@ async def _wait_for_callback() -> tuple[str, str | None]:
             "before _wait_for_oauth_callback"
         )
 
-    # The callback server is already running (started in build_oauth_auth).
-    # We just need to poll for the result.
-    handler_cls, result = _make_callback_handler()
+    global _oauth_result
+    if _oauth_result is None:
+        handler_cls, result = _make_callback_handler()
+        _oauth_result = result
+    else:
+        handler_cls = None
+        result = _oauth_result
 
-    # Start a temporary server on the known port
+    server = None
+    server_thread = None
+    bind_host = _oauth_bind_host or "127.0.0.1"
+    if bind_host == "localhost":
+        bind_host = ""
+
     try:
-        server = HTTPServer(("127.0.0.1", _oauth_port), handler_cls)
-    except OSError:
-        # Port already in use — the server from build_oauth_auth is running.
-        # Fall back to polling the server started by build_oauth_auth.
-        raise OAuthNonInteractiveError(
-            "OAuth callback timed out — could not bind callback port. "
-            "Complete the authorization in a browser first, then retry."
-        )
+        if handler_cls is not None:
+            try:
+                server = HTTPServer((bind_host, _oauth_port), handler_cls)
+                server_thread = threading.Thread(target=server.handle_request, daemon=True)
+                server_thread.start()
+            except OSError:
+                # Another callback listener for this flow is already active.
+                server = None
+                server_thread = None
 
-    server_thread = threading.Thread(target=server.handle_request, daemon=True)
-    server_thread.start()
-
-    timeout = 300.0
-    poll_interval = 0.5
-    elapsed = 0.0
-    try:
+        timeout = 300.0
+        poll_interval = 0.5
+        elapsed = 0.0
         while elapsed < timeout:
             if result["auth_code"] is not None or result["error"] is not None:
                 break
             await asyncio.sleep(poll_interval)
             elapsed += poll_interval
     finally:
-        server.server_close()
+        if server is not None:
+            server.server_close()
 
     if result["error"]:
         raise RuntimeError(f"OAuth authorization failed: {result['error']}")
@@ -610,11 +620,12 @@ def _configure_callback_port(cfg: dict) -> int:
     flows); replacing it with a ContextVar is out of scope for this
     consolidation PR.
     """
-    global _oauth_port
+    global _oauth_port, _oauth_bind_host
     requested = int(cfg.get("redirect_port", 0))
     port = _find_free_port() if requested == 0 else requested
     cfg["_resolved_port"] = port
     _oauth_port = port  # legacy consumer: _wait_for_callback reads this
+    _oauth_bind_host = str(cfg.get("redirect_host", "127.0.0.1"))
     return port
 
 
@@ -631,7 +642,8 @@ def _build_client_metadata(cfg: dict) -> "OAuthClientMetadata":
         )
     client_name = cfg.get("client_name", "Hermes Agent")
     scope = cfg.get("scope")
-    redirect_uri = f"http://127.0.0.1:{port}/callback"
+    redirect_host = cfg.get("redirect_host", "127.0.0.1")
+    redirect_uri = f"http://{redirect_host}:{port}/callback"
 
     metadata_kwargs: dict[str, Any] = {
         "client_name": client_name,
@@ -658,7 +670,8 @@ def _maybe_preregister_client(
     if not client_id:
         return
     port = cfg["_resolved_port"]
-    redirect_uri = f"http://127.0.0.1:{port}/callback"
+    redirect_host = cfg.get("redirect_host", "127.0.0.1")
+    redirect_uri = f"http://{redirect_host}:{port}/callback"
 
     info_dict: dict[str, Any] = {
         "client_id": client_id,
@@ -709,6 +722,9 @@ def build_oauth_auth(
 
     cfg = dict(oauth_config or {})  # copy — we mutate _resolved_port
     storage = HermesTokenStorage(server_name)
+
+    global _oauth_result
+    _oauth_result = None
 
     if not _is_interactive() and not storage.has_cached_tokens():
         logger.warning(
