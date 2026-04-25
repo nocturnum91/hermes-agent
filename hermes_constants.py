@@ -163,22 +163,30 @@ def display_hermes_home() -> str:
 
 
 def get_subprocess_home() -> str | None:
-    """Return a per-profile HOME directory for subprocesses, or None.
+    """Return an optional HOME override for subprocesses, or None.
 
-    When ``{HERMES_HOME}/home/`` exists on disk, subprocesses should use it
-    as ``HOME`` so system tools (git, ssh, gh, npm …) write their configs
-    inside the Hermes data directory instead of the OS-level ``/root`` or
-    ``~/``.  This provides:
+    By default, when ``{HERMES_HOME}/home/`` exists on disk, subprocesses use
+    it as ``HOME`` so system tools (git, ssh, gh, npm …) write configs inside
+    the Hermes data directory instead of the OS-level ``/root`` or ``~/``.
 
-    * **Docker persistence** — tool configs land inside the persistent volume.
-    * **Profile isolation** — each profile gets its own git identity, SSH
-      keys, gh tokens, etc.
+    The behavior can be configured with environment variables loaded by the
+    profile/gateway process:
+
+    * ``HERMES_PROFILE_HOME_ISOLATION=0`` (or false/no/off) disables the
+      profile HOME override and leaves the parent process HOME intact.
+    * ``HERMES_SUBPROCESS_HOME=/path`` forces a specific HOME for subprocesses.
 
     The Python process's own ``os.environ["HOME"]`` and ``Path.home()`` are
     **never** modified — only subprocess environments should inject this value.
-    Activation is directory-based: if the ``home/`` subdirectory doesn't
-    exist, returns ``None`` and behavior is unchanged.
     """
+    isolation = os.getenv("HERMES_PROFILE_HOME_ISOLATION", "").strip().lower()
+    if isolation in {"0", "false", "no", "off"}:
+        return None
+
+    explicit_home = os.getenv("HERMES_SUBPROCESS_HOME", "").strip()
+    if explicit_home:
+        return explicit_home
+
     hermes_home = os.getenv("HERMES_HOME")
     if not hermes_home:
         return None

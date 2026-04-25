@@ -53,6 +53,30 @@ class TestGetSubprocessHome:
         from hermes_constants import get_subprocess_home
         assert get_subprocess_home() == str(profile_home)
 
+    @pytest.mark.parametrize("value", ["0", "false", "no", "off", "FALSE"])
+    def test_can_disable_profile_home_isolation(self, tmp_path, monkeypatch, value):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "home").mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_PROFILE_HOME_ISOLATION", value)
+
+        from hermes_constants import get_subprocess_home
+
+        assert get_subprocess_home() is None
+
+    def test_explicit_subprocess_home_overrides_profile_home(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "home").mkdir()
+        explicit_home = tmp_path / "real-home"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_SUBPROCESS_HOME", str(explicit_home))
+
+        from hermes_constants import get_subprocess_home
+
+        assert get_subprocess_home() == str(explicit_home)
+
     def test_two_profiles_get_different_homes(self, tmp_path, monkeypatch):
         base = tmp_path / ".hermes" / "profiles"
         for name in ("alpha", "beta"):
