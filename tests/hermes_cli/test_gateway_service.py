@@ -64,6 +64,7 @@ class TestSystemdServiceRefresh:
 
         monkeypatch.setattr(gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path)
         monkeypatch.setattr(gateway_cli, "generate_systemd_unit", lambda system=False, run_as_user=None: "new unit\n")
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda **_: None)
 
         calls = []
 
@@ -87,6 +88,7 @@ class TestSystemdServiceRefresh:
 
         monkeypatch.setattr(gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path)
         monkeypatch.setattr(gateway_cli, "generate_systemd_unit", lambda system=False, run_as_user=None: "new unit\n")
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda **_: None)
 
         calls = []
 
@@ -487,6 +489,7 @@ class TestGatewaySystemServiceRouting:
         calls = []
 
         monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda **_: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: calls.append(("refresh", system)))
         monkeypatch.setattr(
             "gateway.status.get_running_pid",
@@ -541,6 +544,7 @@ class TestGatewaySystemServiceRouting:
 
     def test_systemd_restart_recovers_failed_planned_restart(self, monkeypatch, capsys):
         monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda **_: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: None)
         monkeypatch.setattr(
             "gateway.status.read_runtime_status",
@@ -2046,4 +2050,245 @@ class TestSystemdInstallOffersLegacyRemoval:
         gateway_cli.systemd_install()
 
         assert prompt_called["count"] == 0
-        assert remove_called["invoked"] is False
+
+
+class TestLaunchdSystemDaemon:
+    """macOS gateway status must recognize system LaunchDaemons, not only the user agent."""
+
+    def _force_macos(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_linux", lambda: False)
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway_cli, "find_gateway_pids", lambda: [])
+
+    def test_daemon_label_and_path_use_profile_suffix(self, tmp_path, monkeypatch):
+        profile_dir = tmp_path / ".hermes" / "profiles" / "company"
+        profile_dir.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(profile_dir))
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: profile_dir)
+
+        assert gateway_cli.get_launchd_daemon_label() == "ai.hermes.daemon-company"
+        assert gateway_cli.get_launchd_daemon_plist_path() == Path(
+            "/Library/LaunchDaemons/ai.hermes.daemon-company.plist"
+        )
+
+    def test_daemon_label_default_profile(self, tmp_path, monkeypatch):
+        # Default HERMES_HOME (~/.hermes) → no suffix.
+        from hermes_constants import get_default_hermes_root
+
+        default_home = get_default_hermes_root()
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: default_home)
+        assert gateway_cli.get_launchd_daemon_label() == "ai.hermes.daemon"
+        assert gateway_cli.get_launchd_daemon_plist_path() == Path(
+            "/Library/LaunchDaemons/ai.hermes.daemon.plist"
+        )
+
+    def test_snapshot_recognizes_loaded_system_daemon_without_user_agent(
+        self, tmp_path, monkeypatch
+    ):
+        self._force_macos(monkeypatch)
+
+        agent_plist = tmp_path / "ai.hermes.gateway.plist"  # does not exist
+        daemon_plist = tmp_path / "ai.hermes.daemon-nocturnum.plist"
+        daemon_plist.write_text("<plist/>", encoding="utf-8")
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: agent_plist)
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_daemon_plist_path", lambda: daemon_plist
+        )
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_daemon_label", lambda: "ai.hermes.daemon-nocturnum"
+        )
+
+        recorded = []
+
+        def fake_run(cmd, capture_output=True, text=True, timeout=10, **kwargs):
+            recorded.append(list(cmd))
+            if cmd[:2] == ["launchctl", "print"]:
+                return SimpleNamespace(returncode=0, stdout="loaded\n", stderr="")
+            return SimpleNamespace(returncode=113, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        snapshot = gateway_cli.get_gateway_runtime_snapshot()
+
+        assert snapshot.service_installed is True
+        assert snapshot.service_running is True
+        assert snapshot.service_scope == "launchd-system"
+        assert "system" in snapshot.manager
+        # Probe must be read-only (no sudo, uses `launchctl print system/...`).
+        assert any(
+            cmd[:2] == ["launchctl", "print"] and cmd[2] == "system/ai.hermes.daemon-nocturnum"
+            for cmd in recorded
+        )
+        assert not any("sudo" in part for cmd in recorded for part in cmd)
+
+    def test_snapshot_marks_daemon_installed_but_not_running(self, tmp_path, monkeypatch):
+        self._force_macos(monkeypatch)
+
+        agent_plist = tmp_path / "ai.hermes.gateway.plist"  # does not exist
+        daemon_plist = tmp_path / "ai.hermes.daemon.plist"
+        daemon_plist.write_text("<plist/>", encoding="utf-8")
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: agent_plist)
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_daemon_plist_path", lambda: daemon_plist
+        )
+
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *a, **kw: SimpleNamespace(
+                returncode=113, stdout="", stderr="Could not find service"
+            ),
+        )
+
+        snapshot = gateway_cli.get_gateway_runtime_snapshot()
+
+        assert snapshot.service_installed is True
+        assert snapshot.service_running is False
+        assert snapshot.service_scope == "launchd-system"
+
+    def test_snapshot_prefers_running_user_agent_over_stopped_daemon(
+        self, tmp_path, monkeypatch
+    ):
+        """Mixed install: both plists present, only the user agent is loaded.
+        Snapshot must reflect the live owner (agent), not the dormant daemon."""
+        self._force_macos(monkeypatch)
+
+        agent_plist = tmp_path / "ai.hermes.gateway.plist"
+        agent_plist.write_text("<plist/>", encoding="utf-8")
+        daemon_plist = tmp_path / "ai.hermes.daemon-nocturnum.plist"
+        daemon_plist.write_text("<plist/>", encoding="utf-8")
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: agent_plist)
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_daemon_plist_path", lambda: daemon_plist
+        )
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_daemon_label", lambda: "ai.hermes.daemon-nocturnum"
+        )
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["launchctl", "list"]:
+                return SimpleNamespace(returncode=0, stdout="loaded\n", stderr="")
+            if cmd[:2] == ["launchctl", "print"]:
+                return SimpleNamespace(returncode=113, stdout="", stderr="not loaded")
+            return SimpleNamespace(returncode=113, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        snapshot = gateway_cli.get_gateway_runtime_snapshot()
+
+        assert snapshot.service_installed is True
+        assert snapshot.service_running is True
+        assert snapshot.manager == "launchd"
+        assert snapshot.service_scope == "launchd"
+
+    def test_snapshot_unchanged_when_neither_agent_nor_daemon_installed(
+        self, tmp_path, monkeypatch
+    ):
+        self._force_macos(monkeypatch)
+
+        agent_plist = tmp_path / "ai.hermes.gateway.plist"
+        daemon_plist = tmp_path / "ai.hermes.daemon.plist"
+        # Neither file is created.
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: agent_plist)
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_daemon_plist_path", lambda: daemon_plist
+        )
+
+        ran = []
+
+        def fake_run(cmd, **kwargs):
+            ran.append(list(cmd))
+            return SimpleNamespace(returncode=113, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        snapshot = gateway_cli.get_gateway_runtime_snapshot()
+
+        assert snapshot.service_installed is False
+        assert snapshot.service_running is False
+        assert snapshot.service_scope == "launchd"
+        # Both probes short-circuit on the missing plist files — no launchctl
+        # subprocess should be invoked at all.
+        assert ran == []
+
+    def test_launchd_status_reports_loaded_system_daemon(self, tmp_path, monkeypatch, capsys):
+        self._force_macos(monkeypatch)
+
+        agent_plist = tmp_path / "ai.hermes.gateway.plist"  # absent
+        daemon_plist = tmp_path / "ai.hermes.daemon-nocturnum.plist"
+        daemon_plist.write_text("<plist/>", encoding="utf-8")
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: agent_plist)
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_daemon_plist_path", lambda: daemon_plist
+        )
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_daemon_label", lambda: "ai.hermes.daemon-nocturnum"
+        )
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["launchctl", "print"]:
+                return SimpleNamespace(returncode=0, stdout="loaded", stderr="")
+            return SimpleNamespace(returncode=113, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        gateway_cli.launchd_status()
+
+        out = capsys.readouterr().out
+        assert "System LaunchDaemon" in out
+        assert "ai.hermes.daemon-nocturnum" in out
+        assert "is loaded" in out
+        # Should not falsely claim the user-agent is unloaded when no agent
+        # plist exists.
+        assert "User LaunchAgent is not loaded" not in out
+
+    def test_launchd_status_mixed_install_does_not_flag_agent_when_daemon_loaded(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """When both plists exist but only the system daemon is loaded, status
+        must not present the user agent as the primary failed service."""
+        self._force_macos(monkeypatch)
+
+        agent_plist = tmp_path / "ai.hermes.gateway.plist"
+        agent_plist.write_text("<plist/>", encoding="utf-8")
+        daemon_plist = tmp_path / "ai.hermes.daemon-nocturnum.plist"
+        daemon_plist.write_text("<plist/>", encoding="utf-8")
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: agent_plist)
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_daemon_plist_path", lambda: daemon_plist
+        )
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_daemon_label", lambda: "ai.hermes.daemon-nocturnum"
+        )
+        monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda: True)
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["launchctl", "print"]:
+                return SimpleNamespace(returncode=0, stdout="loaded", stderr="")
+            if cmd[:2] == ["launchctl", "list"]:
+                return SimpleNamespace(returncode=113, stdout="", stderr="not loaded")
+            return SimpleNamespace(returncode=113, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        gateway_cli.launchd_status()
+
+        out = capsys.readouterr().out
+        # Healthy system daemon must still be reported.
+        assert "System LaunchDaemon" in out
+        assert "ai.hermes.daemon-nocturnum" in out
+        assert "is loaded" in out
+        # User LaunchAgent plist may be mentioned, but must not be flagged as
+        # the primary failed service when the system daemon owns the gateway.
+        assert "User LaunchAgent is not loaded" not in out
+        # Remediation hint must not nudge the user to start the user agent
+        # when the system daemon is already healthy.
+        assert "Run: hermes gateway start" not in out

@@ -630,6 +630,29 @@ def _probe_launchd_service_running() -> bool:
     return result.returncode == 0
 
 
+def _probe_launchd_daemon_running() -> bool:
+    """Read-only probe for the system LaunchDaemon.
+
+    Uses ``launchctl print system/<label>``, which works without sudo for
+    status/metadata (it only requires elevation to mutate the job).  Returns
+    ``True`` when the daemon is loaded into the system domain.
+    """
+    if not get_launchd_daemon_plist_path().exists():
+        return False
+    label = get_launchd_daemon_label()
+    target = f"{_launchd_system_domain()}/{label}"
+    try:
+        result = subprocess.run(
+            ["launchctl", "print", target],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
 def get_gateway_runtime_snapshot(system: bool = False) -> GatewayRuntimeSnapshot:
     """Return a unified view of gateway liveness for the current profile."""
     gateway_pids = tuple(find_gateway_pids())
@@ -659,12 +682,32 @@ def get_gateway_runtime_snapshot(system: bool = False) -> GatewayRuntimeSnapshot
         )
 
     if is_macos():
+        agent_installed = get_launchd_plist_path().exists()
+        daemon_installed = get_launchd_daemon_plist_path().exists()
+        agent_running = _probe_launchd_service_running() if agent_installed else False
+        daemon_running = _probe_launchd_daemon_running() if daemon_installed else False
+        # Prefer whichever service is actually loaded so mixed installs
+        # (both plists present, only one loaded) report the live owner. Fall
+        # back to the system LaunchDaemon when nothing is loaded but the
+        # daemon plist is installed, since it owns shared/multi-profile setups.
+        if daemon_running:
+            manager = "launchd (system daemon)"
+            scope = "launchd-system"
+        elif agent_running:
+            manager = "launchd"
+            scope = "launchd"
+        elif daemon_installed:
+            manager = "launchd (system daemon)"
+            scope = "launchd-system"
+        else:
+            manager = "launchd"
+            scope = "launchd"
         return GatewayRuntimeSnapshot(
-            manager="launchd",
-            service_installed=get_launchd_plist_path().exists(),
-            service_running=_probe_launchd_service_running(),
+            manager=manager,
+            service_installed=agent_installed or daemon_installed,
+            service_running=agent_running or daemon_running,
             gateway_pids=gateway_pids,
-            service_scope="launchd",
+            service_scope=scope,
         )
 
     return GatewayRuntimeSnapshot(
@@ -1498,6 +1541,25 @@ def get_launchd_plist_path() -> Path:
     name = f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
     return _launchd_user_home() / "Library" / "LaunchAgents" / f"{name}.plist"
 
+
+def get_launchd_daemon_label() -> str:
+    """Return the system LaunchDaemon label, scoped per profile.
+
+    System-installed gateways use ``ai.hermes.daemon[-<profile>]`` rather than
+    the user-agent ``ai.hermes.gateway[-<profile>]`` label.  ``hermes`` itself
+    only installs the user agent today, but operators often install a system
+    LaunchDaemon manually so the gateway runs at boot regardless of login;
+    status/dump probes need to recognize that label too.
+    """
+    suffix = _profile_suffix()
+    return f"ai.hermes.daemon-{suffix}" if suffix else "ai.hermes.daemon"
+
+
+def get_launchd_daemon_plist_path() -> Path:
+    """Return the system LaunchDaemon plist path under /Library/LaunchDaemons."""
+    label = get_launchd_daemon_label()
+    return Path("/Library/LaunchDaemons") / f"{label}.plist"
+
 def _detect_venv_dir() -> Path | None:
     """Detect the active virtualenv directory.
 
@@ -2115,6 +2177,11 @@ def _launchd_domain() -> str:
     return f"gui/{os.getuid()}"
 
 
+def _launchd_system_domain() -> str:
+    """Return the launchctl domain for system-level LaunchDaemons."""
+    return "system"
+
+
 def generate_launchd_plist() -> str:
     python_path = get_python_path()
     working_dir = str(PROJECT_ROOT)
@@ -2391,34 +2458,86 @@ def launchd_restart():
 def launchd_status(deep: bool = False):
     plist_path = get_launchd_plist_path()
     label = get_launchd_label()
-    try:
-        result = subprocess.run(
-            ["launchctl", "list", label],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        loaded = result.returncode == 0
-        loaded_output = result.stdout
-    except subprocess.TimeoutExpired:
-        loaded = False
-        loaded_output = ""
+    daemon_plist_path = get_launchd_daemon_plist_path()
+    daemon_label = get_launchd_daemon_label()
 
-    print(f"Launchd plist: {plist_path}")
-    if launchd_plist_is_current():
-        print("✓ Service definition matches the current Hermes install")
-    else:
-        print("⚠ Service definition is stale relative to the current Hermes install")
-        print("  Run: hermes gateway start")
+    agent_installed = plist_path.exists()
+    daemon_installed = daemon_plist_path.exists()
 
-    if loaded:
-        print("✓ Gateway service is loaded")
-        print(loaded_output)
+    if agent_installed:
+        try:
+            result = subprocess.run(
+                ["launchctl", "list", label],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            agent_loaded = result.returncode == 0
+            agent_loaded_output = result.stdout
+        except subprocess.TimeoutExpired:
+            agent_loaded = False
+            agent_loaded_output = ""
     else:
-        print("✗ Gateway service is not loaded")
-        print("  Service definition exists locally but launchd has not loaded it.")
-        print("  Run: hermes gateway start")
-    
+        agent_loaded = False
+        agent_loaded_output = ""
+
+    if daemon_installed:
+        target = f"{_launchd_system_domain()}/{daemon_label}"
+        try:
+            daemon_result = subprocess.run(
+                ["launchctl", "print", target],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            daemon_loaded = daemon_result.returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            daemon_loaded = False
+    else:
+        daemon_loaded = False
+
+    daemon_is_primary = daemon_installed and daemon_loaded
+
+    if agent_installed:
+        print(f"User LaunchAgent plist: {plist_path}")
+        if daemon_is_primary and not agent_loaded:
+            # System LaunchDaemon below owns the gateway in this configuration;
+            # surface the agent plist informationally rather than as a failure.
+            print(
+                "  ℹ Inactive — System LaunchDaemon owns the gateway in this configuration"
+            )
+        else:
+            if launchd_plist_is_current():
+                print("✓ Service definition matches the current Hermes install")
+            else:
+                print("⚠ Service definition is stale relative to the current Hermes install")
+                print("  Run: hermes gateway start")
+
+            if agent_loaded:
+                print("✓ User LaunchAgent is loaded")
+                print(agent_loaded_output)
+            else:
+                print("✗ User LaunchAgent is not loaded")
+                print("  Service definition exists locally but launchd has not loaded it.")
+                if not daemon_installed:
+                    print("  Run: hermes gateway start")
+
+    if daemon_installed:
+        if agent_installed:
+            print()
+        print(f"System LaunchDaemon plist: {daemon_plist_path}")
+        if daemon_loaded:
+            print(f"✓ System LaunchDaemon ({daemon_label}) is loaded")
+        else:
+            print(f"✗ System LaunchDaemon ({daemon_label}) is not loaded")
+            print("  Plist is installed under /Library/LaunchDaemons but not bootstrapped.")
+            print(f"  Run: sudo launchctl bootstrap system {daemon_plist_path}")
+
+    if not agent_installed and not daemon_installed:
+        print(f"Launchd plist: {plist_path}")
+        print("✗ No launchd service definition found")
+        print("  Run: hermes gateway install")
+
     if deep:
         log_file = get_hermes_home() / "logs" / "gateway.log"
         if log_file.exists():
@@ -4409,7 +4528,7 @@ def _gateway_command_inner(args):
         if supports_systemd_services() and (get_systemd_unit_path(system=False).exists() or get_systemd_unit_path(system=True).exists()):
             systemd_status(deep, system=system, full=full)
             _print_gateway_process_mismatch(snapshot)
-        elif is_macos() and get_launchd_plist_path().exists():
+        elif is_macos() and (get_launchd_plist_path().exists() or get_launchd_daemon_plist_path().exists()):
             launchd_status(deep)
             _print_gateway_process_mismatch(snapshot)
         else:
