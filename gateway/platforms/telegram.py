@@ -2759,6 +2759,26 @@ class TelegramAdapter(BasePlatformAdapter):
         chat_type = str(getattr(chat, "type", "")).split(".")[-1].lower()
         return chat_type in ("group", "supergroup")
 
+    @classmethod
+    def _effective_message_thread_id(cls, message: Message) -> Optional[str]:
+        """Return ``message_thread_id`` with forum General-topic normalization.
+
+        Forum supergroup messages posted in the General topic arrive with
+        ``message_thread_id=None``, while Telegram itself addresses that
+        topic as thread id ``1``. Gates and skill-binding code must see the
+        same identifier in both directions, so normalize here.
+        """
+        raw = getattr(message, "message_thread_id", None)
+        if raw is not None:
+            return str(raw)
+        chat = getattr(message, "chat", None)
+        if chat is None:
+            return None
+        chat_type = str(getattr(chat, "type", "")).split(".")[-1].lower()
+        if chat_type in ("group", "supergroup") and getattr(chat, "is_forum", False):
+            return cls._GENERAL_TOPIC_THREAD_ID
+        return None
+
     def _is_reply_to_bot(self, message: Message) -> bool:
         if not self._bot or not getattr(message, "reply_to_message", None):
             return False
@@ -2783,6 +2803,8 @@ class TelegramAdapter(BasePlatformAdapter):
         # raw substring matches like "foo@hermes_bot.example" are not mentions
         # (bug #12545). Entities also correctly handle @handles inside URLs, code
         # blocks, and quoted text, where a regex scan would over-match.
+        # `/cmd@botname` is emitted as a single ``bot_command`` entity (not a
+        # separate ``mention``); accept it when the suffix matches our bot.
         for source_text, entities in _iter_sources():
             for entity in entities:
                 entity_type = str(getattr(entity, "type", "")).split(".")[-1].lower()
@@ -2792,6 +2814,13 @@ class TelegramAdapter(BasePlatformAdapter):
                     if offset < 0 or length <= 0:
                         continue
                     if source_text[offset:offset + length].strip().lower() == expected:
+                        return True
+                elif entity_type == "bot_command" and expected:
+                    offset = int(getattr(entity, "offset", -1))
+                    length = int(getattr(entity, "length", 0))
+                    if offset < 0 or length <= 0:
+                        continue
+                    if source_text[offset:offset + length].strip().lower().endswith(expected):
                         return True
                 elif entity_type == "text_mention":
                     user = getattr(entity, "user", None)
@@ -2856,7 +2885,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._is_group_chat(message):
             return True
-        thread_id = getattr(message, "message_thread_id", None)
+        thread_id = self._effective_message_thread_id(message)
         if thread_id is not None:
             try:
                 if int(thread_id) in self._telegram_ignored_threads():
