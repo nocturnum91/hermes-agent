@@ -55,10 +55,14 @@ def _ensure_telegram_mock() -> None:
     mod.constants.ParseMode.MARKDOWN = "Markdown"
     mod.constants.ParseMode.MARKDOWN_V2 = "MarkdownV2"
     mod.constants.ParseMode.HTML = "HTML"
-    mod.constants.ChatType.PRIVATE = "private"
-    mod.constants.ChatType.GROUP = "group"
-    mod.constants.ChatType.SUPERGROUP = "supergroup"
-    mod.constants.ChatType.CHANNEL = "channel"
+    for chat_type_name, chat_type_value in (
+        ("PRIVATE", "private"),
+        ("GROUP", "group"),
+        ("SUPERGROUP", "supergroup"),
+        ("CHANNEL", "channel"),
+    ):
+        setattr(mod.constants.ChatType, chat_type_name, chat_type_value)
+        setattr(mod.ChatType, chat_type_name, chat_type_value)
 
     # Real exception classes so ``except (NetworkError, ...)`` clauses
     # in production code don't blow up with TypeError.

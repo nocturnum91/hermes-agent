@@ -4394,6 +4394,31 @@ class TelegramAdapter(BasePlatformAdapter):
         chat_type = str(getattr(chat, "type", "")).split(".")[-1].lower()
         return chat_type in {"group", "supergroup"}
 
+    @classmethod
+    def _effective_message_thread_id(cls, message: Message) -> Optional[str]:
+        """Return the routable thread id for a Telegram message.
+
+        Forum supergroup messages posted in the General topic arrive with
+        ``message_thread_id=None``, while Telegram itself addresses that topic
+        as thread id ``1``.  Private chats are the opposite footgun: Telegram
+        may put ``message_thread_id`` on ordinary DM replies, but those ids are
+        not valid send targets unless Telegram marks the message as a real topic
+        message.  Gates, skill binding, and outbound routing must agree on the
+        same normalized value.
+        """
+        chat = getattr(message, "chat", None)
+        chat_type = str(getattr(chat, "type", "")).split(".")[-1].lower() if chat else ""
+        raw = getattr(message, "message_thread_id", None)
+        if raw is not None:
+            if chat_type in ("group", "supergroup"):
+                return str(raw)
+            if chat_type == "private" and bool(getattr(message, "is_topic_message", False)):
+                return str(raw)
+            return None
+        if chat_type in ("group", "supergroup") and getattr(chat, "is_forum", False):
+            return cls._GENERAL_TOPIC_THREAD_ID
+        return None
+
     def _is_reply_to_bot(self, message: Message) -> bool:
         if not self._bot or not getattr(message, "reply_to_message", None):
             return False
@@ -4466,45 +4491,45 @@ class TelegramAdapter(BasePlatformAdapter):
             yield getattr(message, "text", None) or "", getattr(message, "entities", None) or []
             yield getattr(message, "caption", None) or "", getattr(message, "caption_entities", None) or []
 
-        # Telegram parses mentions server-side and emits MessageEntity objects
-        # (type=mention for @username, type=text_mention for @FirstName targeting
-        # a user without a public username). Those entities are authoritative:
-        # raw substring matches like "foo@hermes_bot.example" are not mentions
-        # (bug #12545). Entities also correctly handle @handles inside URLs, code
-        # blocks, and quoted text, where a regex scan would over-match.
+        # Telegram parses mentions server-side and emits MessageEntity objects;
+        # trust those rather than substring-scanning the raw text. A naive
+        # ``"@hermes_bot" in text`` would over-match: ``foo@hermes_bot.example``
+        # in a URL or code block is not a mention (bug #12545), while entities
+        # correctly delimit only the addressable spans.
+        #
+        # Three entity shapes count as addressing this bot:
+        #   - ``mention``:      inline ``@botname``
+        #   - ``text_mention``: tap-mention of a user that has no @username
+        #   - ``bot_command``:  ``/cmd@botname`` — Telegram's group command
+        #                       menu emits the whole token as a single
+        #                       bot_command entity (no separate mention).
+        #                       Accept only when the ``@suffix`` matches this
+        #                       bot; reject ``/cmd`` (no suffix) and
+        #                       ``/cmd@other_bot`` so multi-bot groups stay
+        #                       disambiguated under require_mention (#15415).
         for source_text, entities in _iter_sources():
             for entity in entities:
                 entity_type = str(getattr(entity, "type", "")).split(".")[-1].lower()
-                if entity_type == "mention" and expected:
-                    offset = int(getattr(entity, "offset", -1))
-                    length = int(getattr(entity, "length", 0))
-                    if offset < 0 or length <= 0:
-                        continue
-                    if source_text[offset:offset + length].strip().lower() == expected:
-                        return True
-                elif entity_type == "text_mention":
+                if entity_type == "text_mention":
                     user = getattr(entity, "user", None)
                     if user and getattr(user, "id", None) == bot_id:
                         return True
-                elif entity_type == "bot_command" and expected:
-                    # Telegram's official group-disambiguation form for slash
-                    # commands (``/cmd@botname``) is emitted as a single
-                    # ``bot_command`` entity covering the whole span — there
-                    # is no accompanying ``mention`` entity. Treat it as a
-                    # direct address to this bot when the ``@botname`` suffix
-                    # matches. This is the form Telegram's own command menu
-                    # autocomplete produces in groups, so dropping it at the
-                    # mention gate would break /new, /reset, /help, ... for
-                    # every group that has ``require_mention`` enabled (#15415).
-                    offset = int(getattr(entity, "offset", -1))
-                    length = int(getattr(entity, "length", 0))
-                    if offset < 0 or length <= 0:
-                        continue
-                    command_text = source_text[offset:offset + length]
-                    at_index = command_text.find("@")
+                    continue
+                if not expected:
+                    continue
+                offset = int(getattr(entity, "offset", -1))
+                length = int(getattr(entity, "length", 0))
+                if offset < 0 or length <= 0:
+                    continue
+                span = source_text[offset:offset + length]
+                if entity_type == "mention":
+                    if span.strip().lower() == expected:
+                        return True
+                elif entity_type == "bot_command":
+                    at_index = span.find("@")
                     if at_index < 0:
                         continue
-                    if command_text[at_index:].strip().lower() == expected:
+                    if span[at_index:].strip().lower() == expected:
                         return True
         if bot_username and re.fullmatch(r"[a-z0-9_]{2,29}bot", bot_username, re.IGNORECASE):
             return bot_username in self._extract_bot_mention_usernames(message)
@@ -4710,12 +4735,10 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._is_group_chat(message):
             return True
-
-        thread_id = getattr(message, "message_thread_id", None)
+        thread_id = self._effective_message_thread_id(message)
         allowed_topics = self._telegram_allowed_topics()
         if allowed_topics:
-            topic_id = str(thread_id) if thread_id is not None else self._GENERAL_TOPIC_THREAD_ID
-            if topic_id not in allowed_topics:
+            if thread_id not in allowed_topics:
                 return False
 
         # Check ignored_threads first — applies to both groups and DM topics
@@ -5510,29 +5533,8 @@ class TelegramAdapter(BasePlatformAdapter):
         elif telegram_chat_type == "channel":
             chat_type = "channel"
 
-        # Resolve Telegram topic name and skill binding.
-        # Only preserve message_thread_id when Telegram marks the message as
-        # a real topic/forum message. Telegram can also populate
-        # message_thread_id for ordinary reply UI anchors; treating those as
-        # durable session threads fragments workflows such as CAPTCHA/login
-        # handoffs where the user later replies "done" in the same group.
-        # Private chats have the same pitfall: only real DM topic messages
-        # (is_topic_message=True) should keep the thread id, otherwise sends
-        # can hit Telegram's 'Message thread not found' error (#3206).
-        thread_id_raw = message.message_thread_id
-        is_topic_message = bool(getattr(message, "is_topic_message", False))
-        is_forum_group = getattr(chat, "is_forum", False) is True
-        thread_id_str = None
-        if thread_id_raw is not None:
-            if chat_type == "group" and (is_topic_message or is_forum_group):
-                thread_id_str = str(thread_id_raw)
-            elif chat_type == "dm" and is_topic_message:
-                thread_id_str = str(thread_id_raw)
-        # For forum groups without an explicit topic, default to the
-        # General-topic id so the gateway routes back to the General topic
-        # rather than dropping into the bot's main channel (#22423).
-        if chat_type == "group" and thread_id_str is None and is_forum_group:
-            thread_id_str = self._GENERAL_TOPIC_THREAD_ID
+        # Resolve routable thread id for DM topics and forum group topics.
+        thread_id_str = self._effective_message_thread_id(message)
         chat_topic = None
         topic_skill = None
 
