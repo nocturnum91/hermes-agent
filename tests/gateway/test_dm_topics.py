@@ -28,10 +28,14 @@ def _ensure_telegram_mock():
     telegram_mod = MagicMock()
     telegram_mod.ext.ContextTypes.DEFAULT_TYPE = type(None)
     telegram_mod.constants.ParseMode.MARKDOWN_V2 = "MarkdownV2"
-    telegram_mod.constants.ChatType.GROUP = "group"
-    telegram_mod.constants.ChatType.SUPERGROUP = "supergroup"
-    telegram_mod.constants.ChatType.CHANNEL = "channel"
-    telegram_mod.constants.ChatType.PRIVATE = "private"
+    for chat_type_name, chat_type_value in (
+        ("GROUP", "group"),
+        ("SUPERGROUP", "supergroup"),
+        ("CHANNEL", "channel"),
+        ("PRIVATE", "private"),
+    ):
+        setattr(telegram_mod.constants.ChatType, chat_type_name, chat_type_value)
+        setattr(telegram_mod.ChatType, chat_type_name, chat_type_value)
 
     for name in ("telegram", "telegram.ext", "telegram.constants", "telegram.request"):
         sys.modules.setdefault(name, telegram_mod)
@@ -449,12 +453,13 @@ def test_cache_dm_topic_from_message_no_overwrite():
 
 def _make_mock_message(chat_id=111, chat_type="private", text="hello", thread_id=None,
                        user_id=42, user_name="Test User", forum_topic_created=None,
-                       is_topic_message=None):
+                       is_topic_message=None, is_forum=False):
     """Create a mock Telegram Message for _build_message_event tests."""
     chat = SimpleNamespace(
         id=chat_id,
         type=chat_type,
         title=None,
+        is_forum=is_forum,
     )
     # Add full_name attribute for DM chats
     if not hasattr(chat, "full_name"):
@@ -572,10 +577,9 @@ def test_build_message_event_preserves_true_dm_topic_thread_id():
 
 # ── _build_message_event: group_topics skill binding ──
 
-# The telegram mock sets sys.modules["telegram.constants"] = telegram_mod (root mock),
-# so `from telegram.constants import ChatType` in telegram.py resolves to
-# telegram_mod.ChatType — not telegram_mod.constants.ChatType.  We must use
-# the same ChatType object the production code sees so equality checks work.
+# The telegram mock maps both ``telegram.constants.ChatType`` and root
+# ``telegram.ChatType`` to the same string values so imports in telegram.py and
+# these tests exercise the same comparisons as python-telegram-bot constants.
 from telegram.constants import ChatType as _ChatType  # noqa: E402
 
 
@@ -645,6 +649,39 @@ def test_group_topic_no_skill_binding():
 
     assert event.auto_skill is None
     assert event.source.chat_topic == "General"
+
+
+def test_group_topic_general_topic_normalization_sets_skill_binding():
+    """Forum General-topic messages should bind using normalized thread id 1.
+
+    Telegram forum supergroup messages in the General topic arrive with
+    ``message_thread_id=None``. ``_build_message_event`` must use the same
+    effective thread id as the gating path so configured ``group_topics``
+    bindings for thread id 1 still set source metadata and auto_skill.
+    """
+    from gateway.platforms.base import MessageType
+
+    adapter = _make_adapter(group_topics_config=[
+        {
+            "chat_id": -1001234567890,
+            "topics": [
+                {"name": "General", "thread_id": 1, "skill": "daily-review"},
+            ],
+        }
+    ])
+
+    msg = _make_mock_message(
+        chat_id=-1001234567890,
+        chat_type=_ChatType.SUPERGROUP,
+        thread_id=None,
+        text="general update",
+        is_forum=True,
+    )
+    event = adapter._build_message_event(msg, MessageType.TEXT)
+
+    assert event.source.thread_id == "1"
+    assert event.source.chat_topic == "General"
+    assert event.auto_skill == "daily-review"
 
 
 def test_group_topic_unmapped_thread_id():
