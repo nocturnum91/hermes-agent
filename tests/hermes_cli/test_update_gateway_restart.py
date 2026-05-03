@@ -103,10 +103,21 @@ def _make_run_side_effect(
                 return subprocess.CompletedProcess(cmd, system_restart_rc, stdout="", stderr=stderr)
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
-        # launchctl list ai.hermes.gateway
+        # launchctl list ai.hermes.gateway — real output is plist-style dict.
         if "launchctl" in joined and "list" in joined:
             if launchctl_loaded:
-                return subprocess.CompletedProcess(cmd, 0, stdout="PID\tStatus\tLabel\n123\t0\tai.hermes.gateway\n", stderr="")
+                return subprocess.CompletedProcess(
+                    cmd, 0,
+                    stdout=(
+                        "{\n"
+                        "\t\"Label\" = \"ai.hermes.gateway\";\n"
+                        "\t\"OnDemand\" = false;\n"
+                        "\t\"PID\" = 123;\n"
+                        "\t\"LastExitStatus\" = 0;\n"
+                        "};\n"
+                    ),
+                    stderr="",
+                )
             return subprocess.CompletedProcess(cmd, 113, stdout="", stderr="Could not find service")
 
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
@@ -218,7 +229,7 @@ class TestLaunchdPlistPath:
 class TestLaunchdPlistCurrentness:
     def test_launchd_plist_is_current_ignores_path_drift(self, tmp_path, monkeypatch):
         plist_path = tmp_path / "ai.hermes.gateway.plist"
-        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda system=False: plist_path)
 
         monkeypatch.setenv("PATH", "/custom/bin:/usr/bin:/bin")
         plist_path.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
@@ -241,7 +252,7 @@ class TestLaunchdPlistRefresh:
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text("<plist>old content</plist>")
 
-        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda system=False: plist_path)
 
         calls = []
         def fake_run(cmd, check=False, **kwargs):
@@ -261,7 +272,7 @@ class TestLaunchdPlistRefresh:
 
     def test_refresh_skips_when_current(self, tmp_path, monkeypatch):
         plist_path = tmp_path / "ai.hermes.gateway.plist"
-        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda system=False: plist_path)
 
         # Write the current expected content
         plist_path.write_text(gateway_cli.generate_launchd_plist())
@@ -279,7 +290,7 @@ class TestLaunchdPlistRefresh:
 
     def test_refresh_skips_when_no_plist(self, tmp_path, monkeypatch):
         plist_path = tmp_path / "nonexistent.plist"
-        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda system=False: plist_path)
 
         result = gateway_cli.refresh_launchd_plist_if_needed()
         assert result is False
@@ -288,7 +299,7 @@ class TestLaunchdPlistRefresh:
         """launchd_start refreshes the plist before starting."""
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text("<plist>old</plist>")
-        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda system=False: plist_path)
 
         calls = []
         def fake_run(cmd, check=False, **kwargs):
@@ -309,7 +320,7 @@ class TestLaunchdPlistRefresh:
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         assert not plist_path.exists()
 
-        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda system=False: plist_path)
 
         calls = []
         def fake_run(cmd, check=False, **kwargs):
@@ -350,7 +361,14 @@ class TestCmdUpdateLaunchdRestart:
             gateway_cli, "is_macos", lambda: True,
         )
         monkeypatch.setattr(
-            gateway_cli, "get_launchd_plist_path", lambda: plist_path,
+            gateway_cli, "get_launchd_plist_path", lambda system=False: plist_path,
+        )
+
+        monkeypatch.setattr(
+            gateway_cli, "_installed_launchd_user_agent_labels", lambda: {gateway_cli.get_launchd_label()}
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_installed_launchd_system_daemon_labels", lambda: set()
         )
 
         mock_run.side_effect = _make_run_side_effect(
@@ -358,15 +376,256 @@ class TestCmdUpdateLaunchdRestart:
             launchctl_loaded=True,
         )
 
-        # Mock launchd_restart + find_gateway_pids (new code discovers all gateways)
-        with patch.object(gateway_cli, "launchd_restart") as mock_launchd_restart, \
-             patch.object(gateway_cli, "find_gateway_pids", return_value=[]):
+        with patch.object(gateway_cli, "find_gateway_pids", return_value=[]):
             cmd_update(mock_args)
 
         captured = capsys.readouterr().out
         assert "Restarted" in captured
         assert "Restart manually: hermes gateway run" not in captured
-        mock_launchd_restart.assert_called_once_with()
+        target = f"gui/{os.getuid()}/{gateway_cli.get_launchd_label()}"  # windows-footgun: ok — macOS launchd test
+        assert ["launchctl", "kickstart", "-k", target] in [
+            call.args[0] for call in mock_run.call_args_list
+        ]
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_update_restarts_non_current_profile_launchagent(
+        self, mock_run, _mock_which, mock_args, capsys, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_linux", lambda: False)
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_launchd_plist_path",
+            lambda system=False: tmp_path / "ai.hermes.gateway.plist",
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_installed_launchd_user_agent_labels",
+            lambda: {"ai.hermes.gateway", "ai.hermes.gateway-coder"},
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_installed_launchd_system_daemon_labels", lambda: set()
+        )
+
+        mock_run.side_effect = _make_run_side_effect(
+            commit_count="3",
+            launchctl_loaded=True,
+        )
+
+        with patch.object(gateway_cli, "find_gateway_pids", return_value=[]):
+            cmd_update(mock_args)
+
+        calls = [call.args[0] for call in mock_run.call_args_list]
+        assert [
+            "launchctl",
+            "kickstart",
+            "-k",
+            f"gui/{os.getuid()}/ai.hermes.gateway-coder",  # windows-footgun: ok — macOS launchd test
+        ] in calls
+        captured = capsys.readouterr().out
+        assert "ai.hermes.gateway-coder" in captured
+        assert "Restarted" in captured
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_update_restarts_system_launchdaemon_with_sigusr1(
+        self, mock_run, _mock_which, mock_args, capsys, tmp_path, monkeypatch,
+    ):
+        """A system LaunchDaemon-only gateway should still be restarted by
+        ``hermes update`` without requiring root-only ``launchctl kickstart``.
+        """
+        agent_plist = tmp_path / "ai.hermes.gateway.plist"  # missing
+        daemon_plist = tmp_path / "ai.hermes.daemon.plist"
+        daemon_plist.write_text("<plist/>")
+        daemon_label = gateway_cli.get_launchd_daemon_label()
+
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_linux", lambda: False)
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_launchd_plist_path",
+            lambda system=False: daemon_plist if system else agent_plist,
+        )
+
+        monkeypatch.setattr(
+            gateway_cli, "_installed_launchd_user_agent_labels", lambda: set()
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_installed_launchd_system_daemon_labels", lambda: {daemon_label}
+        )
+
+        # Simulate launchd respawning the daemon with a fresh PID after
+        # SIGUSR1 drain.  The first `launchctl print` call (pre-drain) reports
+        # the current pid; calls after drain succeeds report the new pid.
+        state = {"drained": False}
+
+        def side_effect(cmd, **kwargs):
+            joined = " ".join(str(c) for c in cmd)
+            if "rev-parse" in joined and "--abbrev-ref" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="main\n", stderr="")
+            if "rev-parse" in joined and "--verify" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if "rev-list" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="3\n", stderr="")
+            if cmd == ["launchctl", "list", gateway_cli.get_launchd_label()]:
+                return subprocess.CompletedProcess(cmd, 113, stdout="", stderr="Could not find service")
+            if cmd == ["launchctl", "print", f"system/{daemon_label}"]:
+                pid = 9999 if state["drained"] else 4242
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    stdout=(
+                        f"system/{daemon_label} = {{\n"
+                        "    active count = 1\n"
+                        f"    pid = {pid}\n"
+                        "    state = running\n"
+                        "}\n"
+                    ),
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        mock_run.side_effect = side_effect
+
+        def fake_graceful(pid, drain_timeout):
+            state["drained"] = True
+            return True
+
+        with patch.object(gateway_cli, "find_gateway_pids", return_value=[]), \
+             patch.object(gateway_cli, "_graceful_restart_via_sigusr1", side_effect=fake_graceful) as graceful:
+            cmd_update(mock_args)
+
+        graceful.assert_called_once_with(4242, drain_timeout=195.0)
+        captured = capsys.readouterr().out
+        assert daemon_label in captured
+        assert "draining" in captured.lower()
+        assert "Restarted" in captured
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_update_restarts_non_current_profile_launchdaemon_with_sigusr1(
+        self, mock_run, _mock_which, mock_args, capsys, tmp_path, monkeypatch,
+    ):
+        agent_plist = tmp_path / "ai.hermes.gateway.plist"  # missing
+        daemon_plist = tmp_path / "ai.hermes.daemon-coder.plist"
+        daemon_plist.write_text("<plist/>\n", encoding="utf-8")
+        daemon_label = "ai.hermes.daemon-coder"
+
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_linux", lambda: False)
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_launchd_plist_path",
+            lambda system=False: daemon_plist if system else agent_plist,
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_installed_launchd_user_agent_labels", lambda: set()
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_installed_launchd_system_daemon_labels", lambda: {daemon_label}
+        )
+        state = {"drained": False}
+
+        def side_effect(cmd, **kwargs):
+            joined = " ".join(str(c) for c in cmd)
+            if "rev-parse" in joined and "--abbrev-ref" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="main\n", stderr="")
+            if "rev-parse" in joined and "--verify" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if "rev-list" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="3\n", stderr="")
+            if cmd == ["launchctl", "print", f"system/{daemon_label}"]:
+                pid = 8888 if state["drained"] else 7777
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    stdout=f"system/{daemon_label} = {{\n  pid = {pid}\n}}\n",
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        mock_run.side_effect = side_effect
+
+        def fake_graceful(pid, drain_timeout):
+            state["drained"] = True
+            return True
+
+        with patch.object(gateway_cli, "find_gateway_pids", return_value=[]), \
+             patch.object(gateway_cli, "_graceful_restart_via_sigusr1", side_effect=fake_graceful) as graceful:
+            cmd_update(mock_args)
+
+        graceful.assert_called_once_with(7777, drain_timeout=195.0)
+        captured = capsys.readouterr().out
+        assert daemon_label in captured
+        assert "Restarted" in captured
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_update_system_launchdaemon_warns_when_launchd_does_not_relaunch(
+        self, mock_run, _mock_which, mock_args, capsys, tmp_path, monkeypatch,
+    ):
+        """SIGUSR1 drain succeeds but launchd never reports a fresh pid (e.g.
+        the plist was unloaded concurrently or KeepAlive policy left the job
+        idle).  We must NOT claim ``Restarted`` — instead surface a warning
+        so operators don't believe the daemon survived the update."""
+        agent_plist = tmp_path / "ai.hermes.gateway.plist"  # missing
+        daemon_plist = tmp_path / "ai.hermes.daemon.plist"
+        daemon_plist.write_text("<plist/>")
+        daemon_label = gateway_cli.get_launchd_daemon_label()
+
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_linux", lambda: False)
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_launchd_plist_path",
+            lambda system=False: daemon_plist if system else agent_plist,
+        )
+
+        def side_effect(cmd, **kwargs):
+            joined = " ".join(str(c) for c in cmd)
+            if "rev-parse" in joined and "--abbrev-ref" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="main\n", stderr="")
+            if "rev-parse" in joined and "--verify" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if "rev-list" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="3\n", stderr="")
+            if cmd == ["launchctl", "list", gateway_cli.get_launchd_label()]:
+                return subprocess.CompletedProcess(cmd, 113, stdout="", stderr="Could not find service")
+            if cmd == ["launchctl", "print", f"system/{daemon_label}"]:
+                # Always report the same (stale) pid so the relaunch poll
+                # times out without observing a fresh pid.
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    stdout=(
+                        f"system/{daemon_label} = {{\n"
+                        "    pid = 4242\n"
+                        "    state = running\n"
+                        "}\n"
+                    ),
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        mock_run.side_effect = side_effect
+
+        # cli_main._wait_for_launchd_daemon_relaunch polls launchctl with
+        # _time.sleep(0.5) until either it sees a fresh pid or its 20s
+        # deadline elapses. The autouse fixture above patches time.sleep
+        # to a no-op for performance — but _time.monotonic() is still the
+        # real monotonic clock, so without mocking the helper the loop
+        # busy-waits ~20 wall-clock seconds. The test only cares that the
+        # warning branch fires when the helper reports "no fresh pid", so
+        # short-circuit the helper to return False directly.
+        with patch.object(gateway_cli, "find_gateway_pids", return_value=[]), \
+             patch.object(gateway_cli, "_graceful_restart_via_sigusr1", return_value=True), \
+             patch.object(cli_main, "_wait_for_launchd_daemon_relaunch", return_value=False):
+            cmd_update(mock_args)
+
+        captured = capsys.readouterr().out
+        assert "drained but launchd did not relaunch" in captured
+        assert "Restarted" not in captured
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
@@ -380,7 +639,7 @@ class TestCmdUpdateLaunchdRestart:
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         # plist does NOT exist — no launchd service
         monkeypatch.setattr(
-            gateway_cli, "get_launchd_plist_path", lambda: plist_path,
+            gateway_cli, "get_launchd_plist_path", lambda system=False: plist_path,
         )
 
         mock_run.side_effect = _make_run_side_effect(
@@ -406,7 +665,7 @@ class TestCmdUpdateLaunchdRestart:
         monkeypatch.setattr(
             gateway_cli,
             "get_launchd_plist_path",
-            lambda: tmp_path / "ai.hermes.gateway.plist",
+            lambda system=False: tmp_path / "ai.hermes.gateway.plist",
         )
 
         mock_run.side_effect = _make_run_side_effect(
@@ -436,7 +695,7 @@ class TestCmdUpdateLaunchdRestart:
         restart.assert_called_once_with("coder", 12345)
         graceful.assert_called_once()
         # Graceful drain succeeded — no SIGTERM fallback needed.
-        kill.assert_not_called()
+        assert not any(c.args[1].name == "SIGTERM" for c in kill.call_args_list)
         assert "Restarting manual gateway profile(s): coder" in captured
         assert "Restart manually: hermes gateway run" not in captured
 
@@ -450,7 +709,7 @@ class TestCmdUpdateLaunchdRestart:
         monkeypatch.setattr(
             gateway_cli,
             "get_launchd_plist_path",
-            lambda: tmp_path / "ai.hermes.gateway.plist",
+            lambda system=False: tmp_path / "ai.hermes.gateway.plist",
         )
 
         mock_run.side_effect = _make_run_side_effect(
@@ -478,7 +737,7 @@ class TestCmdUpdateLaunchdRestart:
         restart.assert_called_once_with("coder", 12345)
         graceful.assert_called_once()
         # Graceful drain returned False → SIGTERM fallback.
-        kill.assert_called_once()
+        assert any(c.args[1].name == "SIGTERM" for c in kill.call_args_list)
         assert "Restarting manual gateway profile(s): coder" in captured
 
     @patch("shutil.which", return_value=None)
@@ -859,7 +1118,7 @@ class TestServicePidExclusion:
 
         monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
         monkeypatch.setattr(gateway_cli, "is_linux", lambda: False)
-        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda system=False: plist_path)
 
         # The service PID that launchd manages after restart
         SERVICE_PID = 42000
@@ -947,7 +1206,7 @@ class TestServicePidExclusion:
 
         monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
         monkeypatch.setattr(gateway_cli, "is_linux", lambda: False)
-        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda system=False: plist_path)
 
         SERVICE_PID = 42000
         MANUAL_PID = 42999
@@ -982,12 +1241,64 @@ class TestServicePidExclusion:
         assert "Restarted" in captured
         # Manual PID should be killed
         manual_kills = [c for c in mock_kill.call_args_list if c.args[0] == MANUAL_PID]
-        assert len(manual_kills) == 1
+        assert len(manual_kills) >= 1
         # Service PID should NOT be killed
         service_kills = [c for c in mock_kill.call_args_list if c.args[0] == SERVICE_PID]
         assert len(service_kills) == 0
         # Should show manual stop message since manual PID was killed
         assert "Stopped 1 manual gateway" in captured
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_update_does_not_treat_other_profile_launchdaemon_pid_as_manual(
+        self, mock_run, _mock_which, mock_args, capsys, monkeypatch, tmp_path,
+    ):
+        """A non-current profile LaunchDaemon PID must be excluded from the
+        all-profile manual sweep instead of receiving a detached manual relaunch
+        or SIGTERM.
+        """
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_linux", lambda: False)
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_launchd_plist_path",
+            lambda system=False: tmp_path / "ai.hermes.gateway.plist",
+        )
+        mock_run.side_effect = _make_run_side_effect(
+            commit_count="3",
+            launchctl_loaded=False,
+        )
+        service_pid = 8765
+        process = gateway_cli.ProfileGatewayProcess(
+            profile="coder",
+            path=tmp_path / ".hermes" / "profiles" / "coder",
+            pid=service_pid,
+        )
+
+        def fake_find_gateway_pids(exclude_pids=None, all_profiles=False):
+            excluded = exclude_pids or set()
+            return [pid for pid in [service_pid] if pid not in excluded]
+
+        def fake_find_profile_gateway_processes(exclude_pids=None):
+            excluded = exclude_pids or set()
+            return [] if service_pid in excluded else [process]
+
+        with patch.object(
+            gateway_cli, "_get_service_pids", return_value={service_pid}
+        ), patch.object(
+            gateway_cli, "find_gateway_pids", side_effect=fake_find_gateway_pids
+        ), patch.object(
+            gateway_cli,
+            "find_profile_gateway_processes",
+            side_effect=fake_find_profile_gateway_processes,
+        ), patch.object(
+            gateway_cli, "launch_detached_profile_gateway_restart"
+        ) as restart, patch("os.kill") as mock_kill:
+            cmd_update(mock_args)
+
+        captured = capsys.readouterr().out
+        restart.assert_not_called()
+        assert not any(c.args[0] == service_pid for c in mock_kill.call_args_list)
+        assert "Restarting manual gateway profile(s): coder" not in captured
 
 
 class TestGetServicePids:
@@ -1016,16 +1327,29 @@ class TestGetServicePids:
         assert 12345 in pids
 
     def test_returns_launchd_pid(self, monkeypatch):
+        """Real `launchctl list <label>` returns plist-style dictionary output,
+        NOT the tabular `PID Status Label` header that no-arg `launchctl list`
+        prints.  The parser must read `"PID" = N;` from the dict."""
         monkeypatch.setattr(gateway_cli, "is_linux", lambda: False)
         monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
-        monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
+        monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda system=False: "ai.hermes.daemon" if system else "ai.hermes.gateway")
 
         def fake_run(cmd, **kwargs):
-            joined = " ".join(str(c) for c in cmd)
-            if "launchctl" in joined and "list" in joined:
+            if cmd[:2] == ["launchctl", "list"] and len(cmd) >= 3:
+                # Real macOS output for `launchctl list ai.hermes.gateway`.
                 return subprocess.CompletedProcess(
                     cmd, 0,
-                    stdout="PID\tStatus\tLabel\n67890\t0\tai.hermes.gateway\n",
+                    stdout=(
+                        "{\n"
+                        "\t\"LimitLoadToSessionType\" = \"Aqua\";\n"
+                        "\t\"Label\" = \"ai.hermes.gateway\";\n"
+                        "\t\"OnDemand\" = false;\n"
+                        "\t\"LastExitStatus\" = 0;\n"
+                        "\t\"PID\" = 67890;\n"
+                        "\t\"TimeOut\" = 30;\n"
+                        "\t\"Program\" = \"/usr/bin/python\";\n"
+                        "};\n"
+                    ),
                     stderr="",
                 )
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
@@ -1034,6 +1358,34 @@ class TestGetServicePids:
 
         pids = gateway_cli._get_service_pids()
         assert 67890 in pids
+
+    def test_returns_no_pid_when_launchd_dict_lacks_pid(self, monkeypatch):
+        """A loaded-but-not-running job has no `PID = ...` entry; parser must
+        return no pid (rather than picking up an unrelated integer)."""
+        monkeypatch.setattr(gateway_cli, "is_linux", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda system=False: "ai.hermes.daemon" if system else "ai.hermes.gateway")
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["launchctl", "list"] and len(cmd) >= 3:
+                return subprocess.CompletedProcess(
+                    cmd, 0,
+                    stdout=(
+                        "{\n"
+                        "\t\"Label\" = \"ai.hermes.gateway\";\n"
+                        "\t\"OnDemand\" = false;\n"
+                        "\t\"LastExitStatus\" = 0;\n"
+                        "\t\"TimeOut\" = 30;\n"
+                        "};\n"
+                    ),
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        pids = gateway_cli._get_service_pids()
+        assert pids == set()
 
     def test_returns_empty_when_no_services(self, monkeypatch):
         monkeypatch.setattr(gateway_cli, "is_linux", lambda: False)
@@ -1119,6 +1471,32 @@ class TestFindGatewayPidsExclude:
         pids = gateway_cli.find_gateway_pids(all_profiles=True)
         assert 100 in pids
         assert 200 in pids
+
+    def test_default_sweep_excludes_service_managed_pids(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "is_windows", lambda: False)
+        # Bypass /proc scan so the subprocess (ps) fallback is used.
+        _real_isdir = os.path.isdir
+        monkeypatch.setattr("os.path.isdir", lambda p: False if p == "/proc" else _real_isdir(p))
+        monkeypatch.setattr(gateway_cli, "_get_ancestor_pids", lambda: {999})
+        monkeypatch.setattr(gateway_cli, "_get_service_pids", lambda: {200})
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 200)
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(
+                cmd, 0,
+                stdout=(
+                    "100 python gateway/run.py\n"
+                    "200 python gateway/run.py\n"
+                ),
+                stderr="",
+            )
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+        monkeypatch.setattr("os.getpid", lambda: 999)
+
+        pids = gateway_cli.find_gateway_pids()
+
+        assert pids == [100]
 
     def test_filters_to_current_profile(self, monkeypatch, tmp_path):
         profile_dir = tmp_path / ".hermes" / "profiles" / "orcha"

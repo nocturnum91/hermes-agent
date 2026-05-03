@@ -889,7 +889,9 @@ def delete_profile(name: str, yes: bool = False) -> Path:
             return profile_dir
 
     # 1. Disable service (prevents auto-restart)
-    _cleanup_gateway_service(canon, profile_dir)
+    if _cleanup_gateway_service(canon, profile_dir) is False:
+        print("Profile deletion cancelled; remove the gateway service first.")
+        return profile_dir
 
     # 2. Stop running gateway
     if gw_running:
@@ -920,7 +922,7 @@ def delete_profile(name: str, yes: bool = False) -> Path:
     return profile_dir
 
 
-def _cleanup_gateway_service(name: str, profile_dir: Path) -> None:
+def _cleanup_gateway_service(name: str, profile_dir: Path) -> bool:
     """Disable and remove systemd/launchd service for a profile."""
     import platform as _platform
 
@@ -951,21 +953,62 @@ def _cleanup_gateway_service(name: str, profile_dir: Path) -> None:
                 print(f"✓ Service {svc_name} removed")
 
         elif _platform.system() == "Darwin":
-            plist_path = get_launchd_plist_path()
-            if plist_path.exists():
+            from hermes_cli.gateway import get_launchd_label
+
+            sudo_user = str(os.environ.get("SUDO_USER") or "").strip()
+            sudo_uid = None
+            sudo_home = None
+            if os.geteuid() == 0 and sudo_user and sudo_user != "root":  # windows-footgun: ok — Darwin-only launchd cleanup path
+                try:
+                    import pwd
+
+                    sudo_pw = pwd.getpwnam(sudo_user)
+                    sudo_uid = sudo_pw.pw_uid
+                    sudo_home = Path(sudo_pw.pw_dir)
+                except (ImportError, KeyError, OSError):
+                    sudo_uid = None
+                    sudo_home = None
+
+            for is_system in (False, True):
+                label = get_launchd_label(system=is_system)
+                if is_system:
+                    plist_path = get_launchd_plist_path(system=True)
+                    domain = "system"
+                elif sudo_uid is not None and sudo_home is not None:
+                    plist_path = sudo_home / "Library" / "LaunchAgents" / f"{label}.plist"
+                    domain = f"gui/{sudo_uid}"
+                else:
+                    plist_path = get_launchd_plist_path(system=False)
+                    domain = f"gui/{os.getuid()}"  # windows-footgun: ok — Darwin-only launchd cleanup path
+                if not plist_path.exists():
+                    continue
+
+                scope = "system LaunchDaemon" if is_system else "LaunchAgent"
+                if is_system and os.geteuid() != 0:  # windows-footgun: ok — Darwin-only launchd cleanup path
+                    print(
+                        f"⚠ {scope} exists at {plist_path} but needs sudo to remove"
+                    )
+                    print("Re-run with sudo before deleting this profile's data.")
+                    return False
+
+                subprocess.run(
+                    ["launchctl", "bootout", f"{domain}/{label}"],
+                    capture_output=True, check=False, timeout=10,
+                )
                 subprocess.run(
                     ["launchctl", "unload", str(plist_path)],
                     capture_output=True, check=False, timeout=10,
                 )
                 plist_path.unlink(missing_ok=True)
-                print(f"✓ Launchd service removed")
+                print(f"✓ {scope} removed")
     except Exception as e:
         print(f"⚠ Service cleanup: {e}")
     finally:
         if old_home is not None:
             os.environ["HERMES_HOME"] = old_home
-        elif "HERMES_HOME" in os.environ:
-            del os.environ["HERMES_HOME"]
+        else:
+            os.environ.pop("HERMES_HOME", None)
+    return True
 
 
 def _stop_gateway_process(profile_dir: Path) -> None:

@@ -109,27 +109,142 @@ def _get_service_pids() -> set:
 
     # --- launchd (macOS) ---
     if is_macos():
-        try:
-            label = get_launchd_label()
-            result = subprocess.run(
-                ["launchctl", "list", label],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode == 0:
-                # Output: "PID\tStatus\tLabel" header, then one data line
-                for line in result.stdout.strip().splitlines():
-                    parts = line.split()
-                    if len(parts) >= 3 and parts[2] == label:
-                        try:
-                            pid = int(parts[0])
-                            if pid > 0:
-                                pids.add(pid)
-                        except ValueError:
-                            pass
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
+        # User LaunchAgents — `launchctl list LABEL` returns a plist-style
+        # dictionary (NOT the tabular `PID Status Label` rows that the no-arg
+        # `launchctl list` produces). Parse `"PID" = N;` from that dict. Probe
+        # every installed Hermes profile label so update's all-profile manual
+        # sweep does not misclassify another profile's LaunchAgent as manual.
+        user_agent_labels = set(_installed_launchd_user_agent_labels())
+        user_agent_labels.add(get_launchd_label(system=False))
+        for label in user_agent_labels:
+            try:
+                target = f"{_launchd_domain(system=False)}/{label}"
+                result = subprocess.run(
+                    ["launchctl", "print", target],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0:
+                    pid = _parse_launchctl_print_pid(result.stdout)
+                    if pid and pid > 0:
+                        pids.add(pid)
+                        continue
+                # Older launchctl builds and unloaded-but-listed jobs may not
+                # answer `print gui/<uid>/<label>` consistently; keep the
+                # legacy same-bootstrap query as a best-effort fallback.
+                result = subprocess.run(
+                    ["launchctl", "list", label],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0:
+                    pid = _parse_launchctl_list_pid(result.stdout)
+                    if pid and pid > 0:
+                        pids.add(pid)
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+
+        # System LaunchDaemons — `launchctl print system/<label>` works without
+        # sudo for the read-only metadata view and exposes ``pid = N`` when the
+        # daemon is loaded. Probe every installed Hermes daemon label for the
+        # same all-profile stale-process exclusion reason as user agents above.
+        for daemon_label in _installed_launchd_system_daemon_labels():
+            try:
+                target = f"{_launchd_system_domain()}/{daemon_label}"
+                result = subprocess.run(
+                    ["launchctl", "print", target],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0:
+                    pid = _parse_launchctl_print_pid(result.stdout)
+                    if pid and pid > 0:
+                        pids.add(pid)
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
 
     return pids
+
+
+def _installed_launchd_user_agent_labels() -> set[str]:
+    """Return installed Hermes user LaunchAgent labels for all local profiles."""
+    labels: set[str] = set()
+    try:
+        launch_agents_dir = get_launchd_plist_path(system=False).parent
+        for plist in launch_agents_dir.glob("ai.hermes.gateway*.plist"):
+            labels.add(plist.stem)
+    except OSError:
+        pass
+    current = get_launchd_plist_path(system=False)
+    if current.exists():
+        labels.add(get_launchd_label(system=False))
+    return labels
+
+
+def _installed_launchd_system_daemon_labels() -> set[str]:
+    """Return installed Hermes system LaunchDaemon labels for all local profiles."""
+    labels: set[str] = set()
+    try:
+        launch_daemons_dir = get_launchd_plist_path(system=True).parent
+        for plist in launch_daemons_dir.glob("ai.hermes.daemon*.plist"):
+            labels.add(plist.stem)
+    except OSError:
+        pass
+    current = get_launchd_plist_path(system=True)
+    if current.exists():
+        labels.add(get_launchd_label(system=True))
+    return labels
+
+
+def _has_installed_launchd_scope() -> bool:
+    """Return true when any Hermes launchd label is installed for any profile."""
+    return bool(
+        _installed_launchd_user_agent_labels()
+        or _installed_launchd_system_daemon_labels()
+    )
+
+
+def _parse_launchctl_list_pid(stdout: str) -> int | None:
+    """Extract PID from ``launchctl list <label>`` plist-style output.
+
+    Real output looks like::
+
+        {
+            "LimitLoadToSessionType" = "Aqua";
+            "Label" = "ai.hermes.gateway";
+            "PID" = 12345;
+            ...
+        };
+
+    Returns ``None`` when the job is loaded but not running (no PID key, e.g.
+    a one-shot daemon between runs).
+    """
+    import re
+
+    for line in stdout.splitlines():
+        match = re.match(r'\s*"?PID"?\s*=\s*(\d+)\s*;?\s*$', line)
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                return None
+    return None
+
+
+def _parse_launchctl_print_pid(stdout: str) -> int | None:
+    """Extract PID from ``launchctl print <domain>/<label>`` output.
+
+    Real output is verbose; the relevant line is ``pid = N`` (no quotes,
+    different from the dict-style ``"PID" = N;`` of ``launchctl list``).
+    Returns ``None`` when the job is loaded but not running.
+    """
+    import re
+
+    for line in stdout.splitlines():
+        match = re.match(r"\s*pid\s*=\s*(\d+)", line)
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                return None
+    return None
 
 
 def _get_parent_pid(pid: int) -> int | None:
@@ -522,15 +637,24 @@ def find_gateway_pids(exclude_pids: set | None = None, all_profiles: bool = Fals
     """
     _exclude = set(exclude_pids or set())
     pids: list[int] = []
+    service_pids = _get_service_pids()
+
+    # Service-manager PIDs should be protected during the default current-profile
+    # manual-process sweep.  ``all_profiles=True`` is the explicit cross-profile
+    # maintenance mode (used by update/restart paths), so only that mode reports
+    # service PIDs as kill candidates.
     if not all_profiles:
+        _exclude.update(service_pids)
         try:
             from gateway.status import get_running_pid
 
             _append_unique_pid(pids, get_running_pid(), _exclude)
         except Exception:
             pass
-    for pid in _get_service_pids():
-        _append_unique_pid(pids, pid, _exclude)
+    else:
+        for pid in service_pids:
+            _append_unique_pid(pids, pid, _exclude)
+
     for pid in _scan_gateway_pids(_exclude, all_profiles=all_profiles):
         _append_unique_pid(pids, pid, _exclude)
     return pids
@@ -969,6 +1093,29 @@ def _probe_launchd_service_running() -> bool:
     return result.returncode == 0
 
 
+def _probe_launchd_daemon_running() -> bool:
+    """Read-only probe for the system LaunchDaemon.
+
+    Uses ``launchctl print system/<label>``, which works without sudo for
+    status/metadata (it only requires elevation to mutate the job).  Returns
+    ``True`` when the daemon is loaded into the system domain.
+    """
+    if not get_launchd_daemon_plist_path().exists():
+        return False
+    label = get_launchd_daemon_label()
+    target = f"{_launchd_system_domain()}/{label}"
+    try:
+        result = subprocess.run(
+            ["launchctl", "print", target],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
 def get_gateway_runtime_snapshot(system: bool = False) -> GatewayRuntimeSnapshot:
     """Return a unified view of gateway liveness for the current profile."""
     gateway_pids = tuple(find_gateway_pids())
@@ -998,12 +1145,32 @@ def get_gateway_runtime_snapshot(system: bool = False) -> GatewayRuntimeSnapshot
         )
 
     if is_macos():
+        agent_installed = get_launchd_plist_path().exists()
+        daemon_installed = get_launchd_daemon_plist_path().exists()
+        agent_running = _probe_launchd_service_running() if agent_installed else False
+        daemon_running = _probe_launchd_daemon_running() if daemon_installed else False
+        # Prefer whichever service is actually loaded so mixed installs
+        # (both plists present, only one loaded) report the live owner. Fall
+        # back to the system LaunchDaemon when nothing is loaded but the
+        # daemon plist is installed, since it owns shared/multi-profile setups.
+        if daemon_running:
+            manager = "launchd (system daemon)"
+            scope = "launchd-system"
+        elif agent_running:
+            manager = "launchd"
+            scope = "launchd"
+        elif daemon_installed:
+            manager = "launchd (system daemon)"
+            scope = "launchd-system"
+        else:
+            manager = "launchd"
+            scope = "launchd"
         return GatewayRuntimeSnapshot(
-            manager="launchd",
-            service_installed=get_launchd_plist_path().exists(),
-            service_running=_probe_launchd_service_running(),
+            manager=manager,
+            service_installed=agent_installed or daemon_installed,
+            service_running=agent_running or daemon_running,
             gateway_pids=gateway_pids,
-            service_scope="launchd",
+            service_scope=scope,
         )
 
     return GatewayRuntimeSnapshot(
@@ -1932,26 +2099,61 @@ def print_systemd_linger_guidance() -> None:
         print("  If you want the gateway user service to survive logout, run:")
         print("  sudo loginctl enable-linger $USER")
 
+def _launchd_user_record():
+    """Return the macOS GUI user record for user LaunchAgent artifacts.
+
+    Under ``sudo``, user LaunchAgents still belong to the original login user,
+    not root.  Resolve ``SUDO_USER`` first so root operations like
+    ``sudo hermes gateway stop --all`` can find and bootout the user's
+    LaunchAgent instead of looking under ``/var/root`` / ``gui/0``.
+    """
+    import pwd
+
+    sudo_user = (os.getenv("SUDO_USER") or "").strip()
+    if sudo_user and sudo_user != "root":
+        try:
+            return pwd.getpwnam(sudo_user)
+        except KeyError:
+            pass
+    try:
+        return pwd.getpwuid(os.getuid())  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
+    except KeyError:
+        from types import SimpleNamespace
+
+        uid = os.getuid()  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
+        logger.debug("No passwd entry for launchd uid %s; using current home fallback", uid)
+        return SimpleNamespace(pw_name=str(uid), pw_uid=uid, pw_dir=str(Path.home()))
+
+
 def _launchd_user_home() -> Path:
     """Return the real macOS user home for launchd artifacts.
 
     Profile-mode Hermes often sets ``HOME`` to a profile-scoped directory, but
     launchd user agents still live under the actual account home.
     """
-    import pwd
-
-    return Path(pwd.getpwuid(os.getuid()).pw_dir)  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
+    return Path(_launchd_user_record().pw_dir)
 
 
-def get_launchd_plist_path() -> Path:
+def get_launchd_plist_path(system: bool = False) -> Path:
     """Return the launchd plist path, scoped per profile.
 
-    Default ``~/.hermes`` → ``ai.hermes.gateway.plist`` (backward compatible).
-    Profile ``~/.hermes/profiles/coder`` → ``ai.hermes.gateway-coder.plist``.
+    Default user agent → ``~/Library/LaunchAgents/ai.hermes.gateway[-profile].plist``.
+    System daemon → ``/Library/LaunchDaemons/ai.hermes.daemon[-profile].plist``.
     """
-    suffix = _profile_suffix()
-    name = f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
-    return _launchd_user_home() / "Library" / "LaunchAgents" / f"{name}.plist"
+    label = get_launchd_label(system=system)
+    if system:
+        return Path("/Library/LaunchDaemons") / f"{label}.plist"
+    return _launchd_user_home() / "Library" / "LaunchAgents" / f"{label}.plist"
+
+
+def get_launchd_daemon_label() -> str:
+    """Backward-compatible alias for :func:`get_launchd_label` with ``system=True``."""
+    return get_launchd_label(system=True)
+
+
+def get_launchd_daemon_plist_path() -> Path:
+    """Backward-compatible alias for :func:`get_launchd_plist_path` with ``system=True``."""
+    return get_launchd_plist_path(system=True)
 
 def _detect_venv_dir() -> Path | None:
     """Detect the active virtualenv directory.
@@ -2070,13 +2272,22 @@ def _remap_path_for_user(path: str, target_home_dir: str) -> str:
     the first ``import``. Keep the symlinked path so the venv activates
     its own environment. Lexical expansion only via ``expanduser``.
     """
-    current_home = Path.home()
+    current_home = Path.home().expanduser()
     p = Path(path).expanduser()
+    home_candidates = [current_home]
     try:
-        relative = p.relative_to(current_home)
-        return str(Path(target_home_dir) / relative)
-    except ValueError:
-        return str(p)
+        resolved_home = current_home.resolve()
+        if resolved_home != current_home:
+            home_candidates.append(resolved_home)
+    except OSError:
+        pass
+    for home in home_candidates:
+        try:
+            relative = p.relative_to(home)
+            return str(Path(target_home_dir) / relative)
+        except ValueError:
+            continue
+    return str(p)
 
 
 def _hermes_home_for_target_user(target_home_dir: str) -> str:
@@ -2105,35 +2316,48 @@ def _hermes_home_for_target_user(target_home_dir: str) -> str:
         return str(current_hermes)
 
 
+def _is_dir_safe(path: Path) -> bool:
+    """``Path.is_dir()`` that treats unreadable directories as absent.
+
+    ``Path.is_dir()`` only swallows ENOENT/ENOTDIR-class errors; it still
+    raises ``PermissionError`` (EACCES) when an ancestor is not traversable.
+    When a sudo/root caller probes candidate service-PATH dirs that live
+    under another user's home (e.g. ``/var/root/.hermes/node/bin``), that
+    raises and aborts plist generation. Treat such dirs as simply absent.
+    """
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
 def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
     """Build PATH directory list for service units, excluding non-existent dirs."""
     if project_root is None:
         project_root = PROJECT_ROOT
 
-    def _is_dir(path: Path) -> bool:
-        try:
-            return path.is_dir()
-        except OSError:
-            return False
-
     candidates = []
 
-    venv_bin = project_root / "venv" / "bin"
-    if _is_dir(venv_bin):
-        candidates.append(str(venv_bin))
-    elif sys.prefix != sys.base_prefix:
-        candidates.append(str(Path(sys.prefix) / "bin"))
+    # Use the same venv resolution as the plist/unit env vars
+    # (``_detect_venv_dir``) so the service PATH stays consistent with
+    # VIRTUAL_ENV — picking up ``.venv`` / ``$VIRTUAL_ENV`` / ``sys.prefix``
+    # rather than blindly assuming a ``<project>/venv`` directory.
+    detected_venv = _detect_venv_dir()
+    if detected_venv is not None:
+        venv_bin = detected_venv / "bin"
+        if _is_dir_safe(venv_bin):
+            candidates.append(str(venv_bin))
 
     node_bin = project_root / "node_modules" / ".bin"
-    if _is_dir(node_bin):
+    if _is_dir_safe(node_bin):
         candidates.append(str(node_bin))
 
     hermes_home = get_hermes_home()
     hermes_node = hermes_home / "node" / "bin"
-    if _is_dir(hermes_node):
+    if _is_dir_safe(hermes_node):
         candidates.append(str(hermes_node))
     hermes_nm = hermes_home / "node_modules" / ".bin"
-    if _is_dir(hermes_nm):
+    if _is_dir_safe(hermes_nm):
         candidates.append(str(hermes_nm))
 
     return candidates
@@ -2762,41 +2986,508 @@ def systemd_status(deep: bool = False, system: bool = False, full: bool = False)
 # Launchd (macOS)
 # =============================================================================
 
-def get_launchd_label() -> str:
-    """Return the launchd service label, scoped per profile."""
+def get_launchd_label(system: bool = False) -> str:
+    """Return the launchd service label, scoped per profile.
+
+    User agent → ``ai.hermes.gateway[-<profile>]`` (backward compatible).
+    System daemon → ``ai.hermes.daemon[-<profile>]``.
+    """
     suffix = _profile_suffix()
+    if system:
+        return f"ai.hermes.daemon-{suffix}" if suffix else "ai.hermes.daemon"
     return f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
 
 
-def _launchd_domain() -> str:
-    return f"gui/{os.getuid()}"  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
+def _launchd_domain(system: bool = False) -> str:
+    if system:
+        return "system"
+    return f"gui/{_launchd_user_record().pw_uid}"
 
 
-def generate_launchd_plist() -> str:
+def _launchd_system_domain() -> str:
+    """Backward-compatible alias for :func:`_launchd_domain` with ``system=True``."""
+    return _launchd_domain(system=True)
+
+
+def _resolve_launchd_run_as_user(run_as_user: str | None) -> str:
+    """Resolve the username a system LaunchDaemon should run as.
+
+    Resolution order (mirrors :func:`_system_service_identity`):
+      1. Explicit ``run_as_user`` argument (whitespace stripped).
+      2. ``SUDO_USER`` env var when set, non-empty, not ``root``, and resolves
+         to a real account.
+      3. Current process user (``pwd.getpwuid(os.getuid())``) when non-root.
+      4. Otherwise (running with euid 0 and no non-root candidate available)
+         raise :class:`ValueError` with an actionable message instructing the
+         operator to pass ``--run-as-user``. We refuse to silently emit a
+         ``UserName=root`` plist; if root really is intended, the operator must
+         say so explicitly via ``--run-as-user root``.
+    """
+    import pwd
+
+    if run_as_user and run_as_user.strip():
+        candidate = run_as_user.strip()
+        try:
+            pwd.getpwnam(candidate)
+        except KeyError as e:
+            raise ValueError(
+                f"--run-as-user references unknown account {candidate!r}. "
+                "Pass --run-as-user <existing-username> instead."
+            ) from e
+        return candidate
+
+    sudo_user = (os.getenv("SUDO_USER") or "").strip()
+    if sudo_user and sudo_user != "root":
+        try:
+            pwd.getpwnam(sudo_user)
+        except KeyError:
+            pass
+        else:
+            return sudo_user
+
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:
+        current = ""
+    else:
+        try:
+            current = pwd.getpwuid(getuid()).pw_name
+        except KeyError:
+            current = ""
+    if current and current != "root":
+        return current
+
+    raise ValueError(
+        "Refusing to install the gateway system LaunchDaemon as root by default. "
+        "Pass --run-as-user <username> so the daemon runs as a normal account "
+        "(e.g. `sudo hermes gateway install --system --run-as-user yourname`). "
+        "Use `--run-as-user root` only if you intentionally want it to run as root."
+    )
+
+
+def _select_launchd_scope(system: bool = False) -> bool:
+    """Decide which launchd scope plain ``hermes gateway`` commands should target.
+
+    Mirrors :func:`_select_systemd_scope`:
+
+    * Explicit ``system=True`` always wins.
+    * Otherwise, when only the system LaunchDaemon plist is installed (no user
+      LaunchAgent plist for this profile), promote to the system scope so a
+      bare ``hermes gateway start`` operates on the actually-installed service
+      rather than silently bootstrapping a brand new user LaunchAgent.
+    * Mixed installs (both plists present) keep the legacy default — the user
+      LaunchAgent — so existing user-agent workflows are unaffected.
+    """
+    if system:
+        return True
+    if not is_macos():
+        return False
+    return (
+        get_launchd_plist_path(system=True).exists()
+        and not get_launchd_plist_path(system=False).exists()
+    )
+
+
+def _launchd_mixed_install(system: bool = False) -> bool:
+    """True when launchd commands cannot trust the shared ``gateway.pid``.
+
+    In mixed installs both the user LaunchAgent and system LaunchDaemon can
+    write the same current-profile ``gateway.pid``.  Scope-specific stop/restart
+    commands must not use that shared PID to signal/kill a process after
+    targeting only one launchd label, because it may belong to the other scope.
+    """
+    if not is_macos():
+        return False
+    user_plist = get_launchd_plist_path(system=False)
+    system_plist = get_launchd_plist_path(system=True)
+    return user_plist != system_plist and user_plist.exists() and system_plist.exists()
+
+
+def _launchd_scopes_with_plists() -> list[bool]:
+    """Return installed launchd scopes, user first then system."""
+    scopes: list[bool] = []
+    if get_launchd_plist_path(system=False).exists():
+        scopes.append(False)
+    if get_launchd_plist_path(system=True).exists():
+        scopes.append(True)
+    return scopes
+
+
+def _launchd_stop_all_scopes() -> int:
+    """Bootout every installed launchd scope for stop/restart --all.
+
+    Killing PIDs alone is not enough for LaunchAgent/LaunchDaemon jobs with
+    KeepAlive; launchd will immediately respawn them.  Use launchctl for every
+    installed label across all local profiles first, then the caller may sweep
+    leftover manual processes.
+    """
+    stopped = 0
+
+    user_labels = sorted(_installed_launchd_user_agent_labels())
+    system_labels = sorted(_installed_launchd_system_daemon_labels())
+    if system_labels:
+        _require_root_for_system_launchd("stop")
+
+    user_domain = _launchd_domain(system=False)
+    for label in user_labels:
+        try:
+            subprocess.run(["launchctl", "bootout", f"{user_domain}/{label}"], check=True, timeout=90)
+            stopped += 1
+        except subprocess.CalledProcessError as e:
+            if e.returncode not in {3, 113}:
+                raise
+        except FileNotFoundError:
+            pass
+
+    system_domain = _launchd_system_domain()
+    for label in system_labels:
+        try:
+            subprocess.run(["launchctl", "bootout", f"{system_domain}/{label}"], check=True, timeout=90)
+            stopped += 1
+        except subprocess.CalledProcessError as e:
+            if e.returncode not in {3, 113}:
+                raise
+        except FileNotFoundError:
+            pass
+
+    return stopped
+
+
+def _require_root_for_system_launchd(action: str) -> None:
+    """Fail fast when a mutating system LaunchDaemon command runs without root.
+
+    Writing to ``/Library/LaunchDaemons`` and bootstrapping the ``system``
+    launchd domain both require euid 0; doing the work without root would
+    fail later with an opaque ``Operation not permitted`` from launchctl. We
+    bail before touching anything and print a sudo hint so the operator can
+    re-run cleanly.
+    """
+    if getattr(os, "geteuid", lambda: 1)() == 0:
+        return
+    print(f"System gateway {action} requires root. Re-run with sudo:")
+    print(f"  sudo hermes gateway {action} --system")
+    sys.exit(1)
+
+
+def _safe_prepare_target_user_dirs(
+    *,
+    target_home_dir: str,
+    hermes_home: str,
+    log_dir: Path,
+    uid: int,
+    gid: int,
+) -> None:
+    """Symlink-safe ``mkdir`` + handle-based ``fchown`` walk for a system
+    LaunchDaemon install.
+
+    Running as root we touch ``~target/.hermes/.../logs``. A pre-existing or
+    attacker-planted symlink at any component (e.g. ``~alice/.hermes -> /etc``)
+    would otherwise let ``mkdir(parents=True)`` traverse outside the target
+    user's tree and ``os.chown`` flip ownership of arbitrary system paths.
+    Path-based ``os.chown`` is also TOCTOU-vulnerable: even after an ``lstat``
+    confirms a real directory, the target user can swap a component for a
+    symlink before the chown re-resolves the path.
+
+    ``O_NOFOLLOW`` only protects the *final* component of an absolute-path
+    open, so an iterative walk that re-opens each component by absolute path
+    is still racy: between iterations the target user can replace an
+    already-verified parent (e.g. ``~alice/.hermes``) with a symlink, and
+    the next ``mkdir(absolute_child_path)`` / ``os.open(absolute_child_path,
+    O_NOFOLLOW)`` will create / open the child *under the swapped target*.
+    We close that window by walking from a held ``target_home`` fd downward:
+    every child component is created and opened relative to the previously
+    verified parent fd via ``dir_fd=``, so the kernel resolves the next
+    name against the inode we already pinned — not against an absolute path
+    the attacker can swap mid-walk.
+
+    Concretely:
+
+    * ``lstat`` ``target_home_dir`` and open it with
+      ``O_RDONLY|O_DIRECTORY|O_NOFOLLOW`` to anchor the walk,
+    * for each relative component under target_home call
+      ``os.mkdir(name, dir_fd=parent_fd)`` if missing, then
+      ``os.open(name, O_RDONLY|O_DIRECTORY|O_NOFOLLOW, dir_fd=parent_fd)``,
+      ``fstat`` the result, and feed the fd forward as the next parent,
+    * apply ownership via :func:`os.fchown` on the held fds so the kernel
+      operates on the inode we verified, never on a path the attacker can
+      race. Path-based ``os.mkdir`` / ``os.open`` is never used for child
+      components under target_home.
+
+    If the platform lacks ``O_NOFOLLOW`` / ``O_DIRECTORY`` / :func:`os.fchown`
+    or ``dir_fd``-aware ``mkdir``/``open`` we refuse to chown rather than
+    fall back to path-based ``os.chown`` on target-user paths.
+
+    Best-effort: any failure (missing user, OS error, hostile component)
+    aborts the chown walk but leaves the plist generation intact, matching
+    the prior best-effort contract.
+    """
+    import stat as _stat
+
+    o_nofollow = getattr(os, "O_NOFOLLOW", None)
+    o_directory = getattr(os, "O_DIRECTORY", None)
+    if o_nofollow is None or o_directory is None or not hasattr(os, "fchown"):
+        return
+    # Do not pre-check ``os.supports_dir_fd`` by function identity here:
+    # tests legitimately monkeypatch ``os.open``/``os.mkdir`` to assert the
+    # dir_fd contract, which would make identity-based membership checks lie.
+    # Instead, pass ``dir_fd=`` below and treat TypeError/OSError as a safe
+    # best-effort skip rather than falling back to absolute-path operations.
+
+    target_home_path = Path(target_home_dir)
+    hermes_home_path = Path(hermes_home)
+
+    try:
+        st = os.lstat(target_home_path)
+    except OSError:
+        return
+    if _stat.S_ISLNK(st.st_mode) or not _stat.S_ISDIR(st.st_mode):
+        return
+
+    try:
+        hermes_home_path.relative_to(target_home_path)
+        hermes_home_under_target = True
+    except ValueError:
+        hermes_home_under_target = False
+
+    open_flags = os.O_RDONLY | o_directory | o_nofollow
+
+    def _descend(parent_fd: int, components: tuple[str, ...]) -> list[int] | None:
+        """Walk *components* under *parent_fd* using ``dir_fd`` for every
+        ``mkdir`` and ``open``. Each child is resolved relative to the
+        previously verified fd, so a swap of an absolute-path ancestor
+        between iterations cannot redirect the next mkdir/open.
+        Returns the held child fds (caller closes), or ``None`` on any
+        hostile/error condition.
+        """
+        owned: list[int] = []
+        cur_fd = parent_fd
+        for name in components:
+            if (
+                not name
+                or name in (".", "..")
+                or "/" in name
+                or "\x00" in name
+            ):
+                for fd in owned:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                return None
+            try:
+                os.mkdir(name, 0o755, dir_fd=cur_fd)
+            except FileExistsError:
+                pass
+            except OSError:
+                for fd in owned:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                return None
+            try:
+                child_fd = os.open(name, open_flags, dir_fd=cur_fd)
+            except OSError:
+                # ``ELOOP`` here means ``name`` is a symlink under cur_fd.
+                for fd in owned:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                return None
+            try:
+                cst = os.fstat(child_fd)
+            except OSError:
+                os.close(child_fd)
+                for fd in owned:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                return None
+            if not _stat.S_ISDIR(cst.st_mode):
+                os.close(child_fd)
+                for fd in owned:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                return None
+            owned.append(child_fd)
+            cur_fd = child_fd
+        return owned
+
+    # Anchor the walk on target_home. ``O_NOFOLLOW`` rejects a
+    # last-second symlink swap of target_home itself; the lstat above
+    # proved it was a real directory at the start of the walk.
+    try:
+        target_home_fd = os.open(target_home_path, open_flags)
+    except OSError:
+        return
+
+    owned_fds: list[int] = []
+    try:
+        try:
+            tst = os.fstat(target_home_fd)
+        except OSError:
+            return
+        if not _stat.S_ISDIR(tst.st_mode):
+            return
+
+        if hermes_home_under_target:
+            # log_dir is hermes_home / "logs" and hermes_home is under
+            # target_home, so the full chain lives under target_home.
+            try:
+                rel_components = log_dir.relative_to(target_home_path).parts
+            except ValueError:
+                return
+            descended = _descend(target_home_fd, rel_components)
+            if descended is None:
+                return
+            owned_fds = descended
+        else:
+            # A custom HERMES_HOME outside the target user's home may point at
+            # an existing privileged/operator-owned directory (for example
+            # /opt/hermes, /etc, or another shared deployment root).  Root must
+            # not create or chown anything there on behalf of run_as_user: doing
+            # so can cross a privilege boundary by transferring ownership of an
+            # arbitrary existing directory.  Leave external paths under operator
+            # control; only target-home-relative Hermes directories are prepared
+            # and fchown'ed by this helper.
+            return
+
+        for fd in owned_fds:
+            try:
+                os.fchown(fd, uid, gid)
+            except OSError:
+                pass
+    finally:
+        for fd in owned_fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.close(target_home_fd)
+        except OSError:
+            pass
+
+
+def generate_launchd_plist(system: bool = False, run_as_user: str | None = None) -> str:
+    import pwd
+
     python_path = get_python_path()
     working_dir = str(PROJECT_ROOT)
-    hermes_home = str(get_hermes_home().resolve())
-    log_dir = get_hermes_home() / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    label = get_launchd_label()
+    label = get_launchd_label(system=system)
+    detected_venv = _detect_venv_dir()
+    venv_bin = str(detected_venv / "bin") if detected_venv else str(PROJECT_ROOT / "venv" / "bin")
+    venv_dir = str(detected_venv) if detected_venv else str(PROJECT_ROOT / "venv")
+    node_bin = str(PROJECT_ROOT / "node_modules" / ".bin")
+
+    user_block = ""
+    extra_env_xml = ""
+    if system:
+        # Sudo invocations resolve everything (HERMES_HOME, ~/, venv) under
+        # /var/root by default. A LaunchDaemon running as ``alice`` cannot
+        # read /var/root paths, so remap home-rooted artifacts to the target
+        # user's home before emitting the plist.
+        username = _resolve_launchd_run_as_user(run_as_user)
+        try:
+            target_home_dir = pwd.getpwnam(username).pw_dir
+        except KeyError as e:
+            raise ValueError(
+                f"--run-as-user references unknown account {username!r}. "
+                "Pass --run-as-user <existing-username> instead."
+            ) from e
+
+        hermes_home = _hermes_home_for_target_user(target_home_dir)
+        python_path = _remap_path_for_user(python_path, target_home_dir)
+        working_dir = _remap_path_for_user(working_dir, target_home_dir)
+        venv_dir = _remap_path_for_user(venv_dir, target_home_dir)
+        venv_bin = _remap_path_for_user(venv_bin, target_home_dir)
+        node_bin = _remap_path_for_user(node_bin, target_home_dir)
+
+        log_dir = Path(hermes_home) / "logs"
+        # Best-effort: ensure the log directory exists with target-user
+        # ownership so launchd can open StandardOutPath/StandardErrorPath,
+        # and that HERMES_HOME plus any intermediate ".hermes/<profile>/"
+        # directories we created as root flip ownership too — otherwise the
+        # daemon launches as the target user but cannot traverse or write
+        # into root-owned parents.
+        #
+        # The walk is symlink- and TOCTOU-safe:
+        # ``_safe_prepare_target_user_dirs`` opens every verified component
+        # with ``O_NOFOLLOW`` and applies ownership via :func:`os.fchown` on
+        # the held fd, so neither a planted ``~alice/.hermes -> /etc``
+        # symlink nor a mid-walk component swap can redirect chown to an
+        # arbitrary system path.
+        if getattr(os, "geteuid", lambda: 1)() == 0:
+            try:
+                pw = pwd.getpwnam(username)
+            except KeyError:
+                pw = None
+            if pw is not None:
+                _safe_prepare_target_user_dirs(
+                    target_home_dir=target_home_dir,
+                    hermes_home=hermes_home,
+                    log_dir=log_dir,
+                    uid=pw.pw_uid,
+                    gid=pw.pw_gid,
+                )
+        else:
+            # Non-root callers (e.g. plist regeneration via
+            # ``launchd_plist_is_current``) cannot chown; just best-effort
+            # create the log directory so the plist refers to a real path.
+            try:
+                log_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+
+        user_block = f"""
+    <key>UserName</key>
+    <string>{username}</string>
+"""
+        extra_env_xml = f"""
+        <key>HOME</key>
+        <string>{target_home_dir}</string>
+        <key>USER</key>
+        <string>{username}</string>
+        <key>LOGNAME</key>
+        <string>{username}</string>"""
+    else:
+        hermes_home = str(get_hermes_home().resolve())
+        log_dir = get_hermes_home() / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+
     profile_arg = _profile_arg(hermes_home)
+
     # Build a sane PATH for the launchd plist.  launchd provides only a
     # minimal default (/usr/bin:/bin:/usr/sbin:/sbin) which misses Homebrew,
     # nvm, cargo, etc.  We prepend venv/bin and node_modules/.bin (matching
     # the systemd unit), then capture the user's full shell PATH so every
     # user-installed tool (node, ffmpeg, …) is reachable.
-    detected_venv = _detect_venv_dir()
-    venv_dir = str(detected_venv) if detected_venv else str(PROJECT_ROOT / "venv")
     # Resolve the directory containing the node binary (e.g. Homebrew, nvm)
     # so it's explicitly in PATH even if the user's shell PATH changes later.
     priority_dirs = _build_service_path_dirs()
     resolved_node = shutil.which("node")
     if resolved_node:
         resolved_node_dir = str(Path(resolved_node).resolve().parent)
+        if system:
+            resolved_node_dir = _remap_path_for_user(resolved_node_dir, target_home_dir)
         if resolved_node_dir not in priority_dirs:
             priority_dirs.append(resolved_node_dir)
+    shell_path_entries = [p for p in os.environ.get("PATH", "").split(":") if p]
+    if system:
+        # Drop calling-user (/var/root, /Users/$SUDO_USER under sudo) entries
+        # and remap any that lived under the calling user's home so the
+        # daemon's PATH points at the target user's tools.
+        priority_dirs = [
+            _remap_path_for_user(p, target_home_dir) for p in priority_dirs
+        ]
+        shell_path_entries = [
+            _remap_path_for_user(p, target_home_dir) for p in shell_path_entries
+        ]
     sane_path = ":".join(
-        dict.fromkeys(priority_dirs + [p for p in os.environ.get("PATH", "").split(":") if p])
+        dict.fromkeys(priority_dirs + shell_path_entries)
     )
 
     # Build ProgramArguments array, including --profile when using a named profile
@@ -2821,15 +3512,15 @@ def generate_launchd_plist() -> str:
 <dict>
     <key>Label</key>
     <string>{label}</string>
-
+{user_block}
     <key>ProgramArguments</key>
     <array>
         {prog_args_xml}
     </array>
-    
+
     <key>WorkingDirectory</key>
     <string>{working_dir}</string>
-    
+
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
@@ -2837,77 +3528,217 @@ def generate_launchd_plist() -> str:
         <key>VIRTUAL_ENV</key>
         <string>{venv_dir}</string>
         <key>HERMES_HOME</key>
-        <string>{hermes_home}</string>
+        <string>{hermes_home}</string>{extra_env_xml}
     </dict>
-    
+
     <key>RunAtLoad</key>
     <true/>
-    
+
     <key>KeepAlive</key>
     <dict>
         <key>SuccessfulExit</key>
         <false/>
     </dict>
-    
+
     <key>StandardOutPath</key>
     <string>{log_dir}/gateway.log</string>
-    
+
     <key>StandardErrorPath</key>
     <string>{log_dir}/gateway.error.log</string>
 </dict>
 </plist>
 """
 
-def launchd_plist_is_current() -> bool:
+def _read_launchd_run_as_user_from_plist(plist_path: Path) -> str | None:
+    """Best-effort parse of the ``UserName`` value from an installed plist."""
+    if not plist_path.exists():
+        return None
+    import re
+
+    try:
+        text = plist_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = re.search(
+        r"<key>\s*UserName\s*</key>\s*<string>([^<]+)</string>",
+        text,
+    )
+    if not match:
+        return None
+    value = match.group(1).strip()
+    return value or None
+
+
+def _read_launchd_hermes_home_from_plist(plist_path: Path) -> str | None:
+    """Best-effort parse of ``EnvironmentVariables.HERMES_HOME`` from a plist."""
+    if not plist_path.exists():
+        return None
+    import plistlib
+
+    try:
+        with plist_path.open("rb") as fh:
+            data = plistlib.load(fh)
+    except (OSError, ValueError, TypeError, plistlib.InvalidFileException):
+        return None
+    env = data.get("EnvironmentVariables") if isinstance(data, dict) else None
+    if not isinstance(env, dict):
+        return None
+    value = env.get("HERMES_HOME")
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _sync_hermes_home_from_launchd_plist(system: bool) -> None:
+    """For system LaunchDaemons, adopt the plist's target-user ``HERMES_HOME``.
+
+    Under ``sudo``, ``HERMES_HOME`` is commonly stripped and ``HOME`` points at
+    root, so gateway status helpers would otherwise read/write root's profile
+    while the LaunchDaemon itself runs with the target user's ``HERMES_HOME``.
+    """
+    if not system:
+        return
+    plist_home = _read_launchd_hermes_home_from_plist(
+        get_launchd_plist_path(system=True)
+    )
+    if not plist_home:
+        return
+    current = os.environ.get("HERMES_HOME", "").strip()
+    if current == plist_home:
+        return
+    os.environ["HERMES_HOME"] = plist_home
+
+
+def launchd_plist_is_current(system: bool = False) -> bool:
     """Check if the installed launchd plist matches the currently generated one."""
-    plist_path = get_launchd_plist_path()
+    plist_path = get_launchd_plist_path(system=system)
     if not plist_path.exists():
         return False
 
     installed = plist_path.read_text(encoding="utf-8")
-    expected = generate_launchd_plist()
+    expected_user = _read_launchd_run_as_user_from_plist(plist_path) if system else None
+    expected = generate_launchd_plist(system=system, run_as_user=expected_user)
     return _normalize_launchd_plist_for_comparison(installed) == _normalize_launchd_plist_for_comparison(expected)
 
 
-def refresh_launchd_plist_if_needed() -> bool:
+def refresh_launchd_plist_if_needed(system: bool = False) -> bool:
     """Rewrite the installed launchd plist when the generated definition has changed.
 
     Unlike systemd, launchd picks up plist changes on the next ``launchctl kill``/
     ``launchctl kickstart`` cycle — no daemon-reload is needed. We still bootout/
     bootstrap to make launchd re-read the updated plist immediately.
     """
-    plist_path = get_launchd_plist_path()
-    if not plist_path.exists() or launchd_plist_is_current():
+    plist_path = get_launchd_plist_path(system=system)
+    if not plist_path.exists():
+        return False
+    if launchd_plist_is_current(system=system):
+        if system:
+            # Even when the contents are current, an existing system plist may
+            # have drifted to user ownership or a writable mode. Repair before
+            # any later bootstrap/kickstart path so launchd does not reject it.
+            _enforce_system_launchd_plist_perms(plist_path)
         return False
 
-    plist_path.write_text(generate_launchd_plist(), encoding="utf-8")
-    label = get_launchd_label()
+    expected_user = _read_launchd_run_as_user_from_plist(plist_path) if system else None
+    plist_path.write_text(
+        generate_launchd_plist(system=system, run_as_user=expected_user),
+        encoding="utf-8",
+    )
+    if system:
+        _enforce_system_launchd_plist_perms(plist_path)
+    label = get_launchd_label(system=system)
+    domain = _launchd_domain(system=system)
     # Bootout/bootstrap so launchd picks up the new definition
-    subprocess.run(["launchctl", "bootout", f"{_launchd_domain()}/{label}"], check=False, timeout=90)
-    subprocess.run(["launchctl", "bootstrap", _launchd_domain(), str(plist_path)], check=False, timeout=30)
+    subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], check=False, timeout=90)
+    subprocess.run(["launchctl", "bootstrap", domain, str(plist_path)], check=False, timeout=30)
     print("↻ Updated gateway launchd service definition to match the current Hermes install")
     return True
 
 
-def launchd_install(force: bool = False):
-    plist_path = get_launchd_plist_path()
-    
+def _enforce_system_launchd_plist_perms(plist_path: Path) -> None:
+    """Set ``root:wheel`` ownership and ``0644`` mode on a system LaunchDaemon plist.
+
+    launchd refuses to load plists under ``/Library/LaunchDaemons`` that are
+    group/world-writable or not owned by ``root`` — and a fresh write inherits
+    the writer's umask/ownership, which can leave the file owned by the
+    invoking ``sudo`` user (``alice:staff``) rather than ``root:wheel``. We
+    therefore harden the plist explicitly between write and ``launchctl
+    bootstrap`` so the daemon either loads cleanly or fails with a clear
+    ``Operation not permitted`` instead of an opaque load error.
+
+    Best-effort: we no-op for non-root callers (the install paths are gated by
+    :func:`_require_root_for_system_launchd` already) and we tolerate test
+    environments where ``grp.getgrnam('wheel')`` is unavailable or
+    ``os.chown``/``os.chmod`` are mocked to raise.
+    """
+    try:
+        os.chmod(plist_path, 0o644)
+    except OSError:
+        pass
+    if getattr(os, "geteuid", lambda: 1)() != 0:
+        return
+    try:
+        import grp
+
+        gid = grp.getgrnam("wheel").gr_gid
+    except (KeyError, ImportError, OSError):
+        # ``wheel`` may not exist on the host (or grp may be unavailable in the
+        # test sandbox). Leave the existing group untouched rather than
+        # guessing a numeric GID.
+        return
+    try:
+        os.chown(plist_path, 0, gid)
+    except OSError:
+        pass
+
+
+def _print_system_launchd_sudo_hint(action: str, plist_path: Path, label: str) -> None:
+    """Print a sudo-oriented next-step hint for system LaunchDaemon operations.
+
+    The actual ``launchctl`` calls are issued without ``sudo`` so unit tests can
+    mock :mod:`subprocess`; the hint exists only to nudge real operators toward
+    the elevated invocation when they hit a permission error.
+    """
+    target = f"system/{label}"
+    if action == "install":
+        print(f"  If you hit a permission error, retry with: sudo launchctl bootstrap system {plist_path}")
+    elif action == "uninstall":
+        print(f"  If you hit a permission error, retry with: sudo launchctl bootout {target}")
+    elif action == "start":
+        print(f"  If you hit a permission error, retry with: sudo launchctl kickstart {target}")
+    elif action == "stop":
+        print(f"  If you hit a permission error, retry with: sudo launchctl bootout {target}")
+
+
+def launchd_install(force: bool = False, system: bool = False, run_as_user: str | None = None):
+    if system:
+        _require_root_for_system_launchd("install")
+    plist_path = get_launchd_plist_path(system=system)
+    label = get_launchd_label(system=system)
+    domain = _launchd_domain(system=system)
+
     if plist_path.exists() and not force:
-        if not launchd_plist_is_current():
+        if not launchd_plist_is_current(system=system):
             print(f"↻ Repairing outdated launchd service at: {plist_path}")
-            refresh_launchd_plist_if_needed()
+            refresh_launchd_plist_if_needed(system=system)
             print("✓ Service definition updated")
             return
+        if system:
+            _enforce_system_launchd_plist_perms(plist_path)
         print(f"Service already installed at: {plist_path}")
         print("Use --force to reinstall")
         return
-    
+
     plist_path.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Installing launchd service to: {plist_path}")
-    plist_path.write_text(generate_launchd_plist())
-    
-    subprocess.run(["launchctl", "bootstrap", _launchd_domain(), str(plist_path)], check=True, timeout=30)
-    
+    scope = "system LaunchDaemon" if system else "launchd service"
+    print(f"Installing {scope} to: {plist_path}")
+    plist_path.write_text(generate_launchd_plist(system=system, run_as_user=run_as_user))
+    if system:
+        _enforce_system_launchd_plist_perms(plist_path)
+
+    subprocess.run(["launchctl", "bootstrap", domain, str(plist_path)], check=True, timeout=30)
+
     print()
     print("✓ Service installed and loaded!")
     print()
@@ -2915,46 +3746,74 @@ def launchd_install(force: bool = False):
     print("  hermes gateway status             # Check status")
     from hermes_constants import display_hermes_home as _dhh
     print(f"  tail -f {_dhh()}/logs/gateway.log  # View logs")
+    if system:
+        _print_system_launchd_sudo_hint("install", plist_path, label)
 
-def launchd_uninstall():
-    plist_path = get_launchd_plist_path()
-    label = get_launchd_label()
-    subprocess.run(["launchctl", "bootout", f"{_launchd_domain()}/{label}"], check=False, timeout=90)
-    
+
+def launchd_uninstall(system: bool = False):
+    system = _select_launchd_scope(system)
+    if system:
+        _require_root_for_system_launchd("uninstall")
+    plist_path = get_launchd_plist_path(system=system)
+    label = get_launchd_label(system=system)
+    domain = _launchd_domain(system=system)
+    subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], check=False, timeout=90)
+
     if plist_path.exists():
         plist_path.unlink()
         print(f"✓ Removed {plist_path}")
-    
-    print("✓ Service uninstalled")
 
-def launchd_start():
-    plist_path = get_launchd_plist_path()
-    label = get_launchd_label()
+    print("✓ Service uninstalled")
+    if system:
+        _print_system_launchd_sudo_hint("uninstall", plist_path, label)
+
+
+def launchd_start(system: bool = False):
+    system = _select_launchd_scope(system)
+    if system:
+        _require_root_for_system_launchd("start")
+    plist_path = get_launchd_plist_path(system=system)
+    label = get_launchd_label(system=system)
+    domain = _launchd_domain(system=system)
 
     # Self-heal if the plist is missing entirely (e.g., manual cleanup, failed upgrade)
     if not plist_path.exists():
         print("↻ launchd plist missing; regenerating service definition")
         plist_path.parent.mkdir(parents=True, exist_ok=True)
-        plist_path.write_text(generate_launchd_plist(), encoding="utf-8")
-        subprocess.run(["launchctl", "bootstrap", _launchd_domain(), str(plist_path)], check=True, timeout=30)
-        subprocess.run(["launchctl", "kickstart", f"{_launchd_domain()}/{label}"], check=True, timeout=30)
+        # When refreshing a system plist we only know the user from the
+        # already-installed file (which is missing here) — fall back to the
+        # invoking user, matching ``launchd_install``'s default.
+        plist_path.write_text(generate_launchd_plist(system=system), encoding="utf-8")
+        if system:
+            _enforce_system_launchd_plist_perms(plist_path)
+        subprocess.run(["launchctl", "bootstrap", domain, str(plist_path)], check=True, timeout=30)
+        subprocess.run(["launchctl", "kickstart", f"{domain}/{label}"], check=True, timeout=30)
         print("✓ Service started")
+        if system:
+            _print_system_launchd_sudo_hint("start", plist_path, label)
         return
 
-    refresh_launchd_plist_if_needed()
+    refresh_launchd_plist_if_needed(system=system)
     try:
-        subprocess.run(["launchctl", "kickstart", f"{_launchd_domain()}/{label}"], check=True, timeout=30)
+        subprocess.run(["launchctl", "kickstart", f"{domain}/{label}"], check=True, timeout=30)
     except subprocess.CalledProcessError as e:
         if e.returncode not in {3, 113}:
             raise
         print("↻ launchd job was unloaded; reloading service definition")
-        subprocess.run(["launchctl", "bootstrap", _launchd_domain(), str(plist_path)], check=True, timeout=30)
-        subprocess.run(["launchctl", "kickstart", f"{_launchd_domain()}/{label}"], check=True, timeout=30)
+        subprocess.run(["launchctl", "bootstrap", domain, str(plist_path)], check=True, timeout=30)
+        subprocess.run(["launchctl", "kickstart", f"{domain}/{label}"], check=True, timeout=30)
     print("✓ Service started")
+    if system:
+        _print_system_launchd_sudo_hint("start", plist_path, label)
 
-def launchd_stop():
-    label = get_launchd_label()
-    target = f"{_launchd_domain()}/{label}"
+def launchd_stop(system: bool = False):
+    system = _select_launchd_scope(system)
+    if system:
+        _require_root_for_system_launchd("stop")
+        _sync_hermes_home_from_launchd_plist(system=True)
+    label = get_launchd_label(system=system)
+    domain = _launchd_domain(system=system)
+    target = f"{domain}/{label}"
     try:
         from gateway.status import get_running_pid, write_planned_stop_marker
         pid = get_running_pid(cleanup_stale=False)
@@ -2973,8 +3832,18 @@ def launchd_stop():
             pass  # Already unloaded — nothing to stop.
         else:
             raise
-    _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
+    if _launchd_mixed_install(system=system):
+        print(
+            "ℹ Mixed launchd install detected; skipped shared gateway.pid wait "
+            "to avoid signaling the other launchd scope."
+        )
+    else:
+        _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
     print("✓ Service stopped")
+    if system:
+        _print_system_launchd_sudo_hint(
+            "stop", get_launchd_plist_path(system=system), label
+        )
 
 def _wait_for_gateway_exit(timeout: float = 10.0, force_after: float | None = 5.0) -> bool:
     """Wait for the gateway process (by saved PID) to exit.
@@ -3018,14 +3887,25 @@ def _wait_for_gateway_exit(timeout: float = 10.0, force_after: float | None = 5.
     return True
 
 
-def launchd_restart():
-    label = get_launchd_label()
-    target = f"{_launchd_domain()}/{label}"
+def launchd_restart(system: bool = False):
+    system = _select_launchd_scope(system)
+    if system:
+        _require_root_for_system_launchd("restart")
+        _sync_hermes_home_from_launchd_plist(system=True)
+        # Repair a current-but-bad system plist before any kickstart/bootstrap
+        # path. launchd rejects /Library/LaunchDaemons plists that are not
+        # root:wheel/0644, and restart can bootstrap an unloaded job without
+        # rewriting the file.
+        refresh_launchd_plist_if_needed(system=True)
+    label = get_launchd_label(system=system)
+    domain = _launchd_domain(system=system)
+    target = f"{domain}/{label}"
     drain_timeout = _get_restart_drain_timeout()
     from gateway.status import get_running_pid
 
     try:
-        pid = get_running_pid()
+        mixed_install = _launchd_mixed_install(system=system)
+        pid = None if mixed_install else get_running_pid()
         if pid is not None and _request_gateway_self_restart(pid):
             print("✓ Service restart requested")
             return
@@ -3045,42 +3925,102 @@ def launchd_restart():
             raise
         # Job not loaded — bootstrap and start fresh
         print("↻ launchd job was unloaded; reloading")
-        plist_path = get_launchd_plist_path()
-        subprocess.run(["launchctl", "bootstrap", _launchd_domain(), str(plist_path)], check=True, timeout=30)
+        plist_path = get_launchd_plist_path(system=system)
+        subprocess.run(["launchctl", "bootstrap", domain, str(plist_path)], check=True, timeout=30)
         subprocess.run(["launchctl", "kickstart", target], check=True, timeout=30)
         print("✓ Service restarted")
 
-def launchd_status(deep: bool = False):
+def launchd_status(deep: bool = False, system: bool = False):
+    """Print launchd service status.
+
+    The ``system`` flag is informational — both the user LaunchAgent and the
+    system LaunchDaemon are inspected so that a mixed install (operator
+    bootstrapped the daemon but the user agent plist still lingers, or vice
+    versa) is reported coherently. ``system=True`` simply enables a sudo hint
+    when the system daemon plist is the one that needs attention.
+    """
     plist_path = get_launchd_plist_path()
     label = get_launchd_label()
-    try:
-        result = subprocess.run(
-            ["launchctl", "list", label],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        loaded = result.returncode == 0
-        loaded_output = result.stdout
-    except subprocess.TimeoutExpired:
-        loaded = False
-        loaded_output = ""
+    daemon_plist_path = get_launchd_daemon_plist_path()
+    daemon_label = get_launchd_daemon_label()
 
-    print(f"Launchd plist: {plist_path}")
-    if launchd_plist_is_current():
-        print("✓ Service definition matches the current Hermes install")
-    else:
-        print("⚠ Service definition is stale relative to the current Hermes install")
-        print("  Run: hermes gateway start")
+    agent_installed = plist_path.exists()
+    daemon_installed = daemon_plist_path.exists()
 
-    if loaded:
-        print("✓ Gateway service is loaded")
-        print(loaded_output)
+    if agent_installed:
+        try:
+            result = subprocess.run(
+                ["launchctl", "list", label],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            agent_loaded = result.returncode == 0
+            agent_loaded_output = result.stdout
+        except subprocess.TimeoutExpired:
+            agent_loaded = False
+            agent_loaded_output = ""
     else:
-        print("✗ Gateway service is not loaded")
-        print("  Service definition exists locally but launchd has not loaded it.")
-        print("  Run: hermes gateway start")
-    
+        agent_loaded = False
+        agent_loaded_output = ""
+
+    if daemon_installed:
+        target = f"{_launchd_system_domain()}/{daemon_label}"
+        try:
+            daemon_result = subprocess.run(
+                ["launchctl", "print", target],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            daemon_loaded = daemon_result.returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            daemon_loaded = False
+    else:
+        daemon_loaded = False
+
+    daemon_is_primary = daemon_installed and daemon_loaded
+
+    if agent_installed:
+        print(f"User LaunchAgent plist: {plist_path}")
+        if daemon_is_primary and not agent_loaded:
+            # System LaunchDaemon below owns the gateway in this configuration;
+            # surface the agent plist informationally rather than as a failure.
+            print(
+                "  ℹ Inactive — System LaunchDaemon owns the gateway in this configuration"
+            )
+        else:
+            if launchd_plist_is_current():
+                print("✓ Service definition matches the current Hermes install")
+            else:
+                print("⚠ Service definition is stale relative to the current Hermes install")
+                print("  Run: hermes gateway start")
+
+            if agent_loaded:
+                print("✓ User LaunchAgent is loaded")
+                print(agent_loaded_output)
+            else:
+                print("✗ User LaunchAgent is not loaded")
+                print("  Service definition exists locally but launchd has not loaded it.")
+                if not daemon_installed:
+                    print("  Run: hermes gateway start")
+
+    if daemon_installed:
+        if agent_installed:
+            print()
+        print(f"System LaunchDaemon plist: {daemon_plist_path}")
+        if daemon_loaded:
+            print(f"✓ System LaunchDaemon ({daemon_label}) is loaded")
+        else:
+            print(f"✗ System LaunchDaemon ({daemon_label}) is not loaded")
+            print("  Plist is installed under /Library/LaunchDaemons but not bootstrapped.")
+            print(f"  Run: sudo launchctl bootstrap system {daemon_plist_path}")
+
+    if not agent_installed and not daemon_installed:
+        print(f"Launchd plist: {plist_path}")
+        print("✗ No launchd service definition found")
+        print("  Run: hermes gateway install")
+
     if deep:
         log_file = get_hermes_home() / "logs" / "gateway.log"
         if log_file.exists():
@@ -4149,7 +5089,10 @@ def _is_service_installed() -> bool:
     if supports_systemd_services():
         return get_systemd_unit_path(system=False).exists() or get_systemd_unit_path(system=True).exists()
     elif is_macos():
-        return get_launchd_plist_path().exists()
+        return (
+            get_launchd_plist_path(system=False).exists()
+            or get_launchd_plist_path(system=True).exists()
+        )
     elif is_windows():
         from hermes_cli import gateway_windows
         return gateway_windows.is_installed()
@@ -4157,7 +5100,13 @@ def _is_service_installed() -> bool:
 
 
 def _is_service_running() -> bool:
-    """Check if the gateway service is currently running."""
+    """Check if the gateway service is currently running.
+
+    On macOS this prefers whichever launchd scope is actually loaded so a
+    system LaunchDaemon owning the gateway is reported as running even when
+    the user LaunchAgent plist is not present. The user LaunchAgent is checked
+    first to preserve the historical default for laptop installs.
+    """
     if supports_systemd_services():
         user_unit_exists = get_systemd_unit_path(system=False).exists()
         system_unit_exists = get_systemd_unit_path(system=True).exists()
@@ -4185,15 +5134,29 @@ def _is_service_running() -> bool:
                 pass
 
         return False
-    elif is_macos() and get_launchd_plist_path().exists():
-        try:
-            result = subprocess.run(
-                ["launchctl", "list", get_launchd_label()],
-                capture_output=True, text=True, timeout=10,
-            )
-            return result.returncode == 0
-        except subprocess.TimeoutExpired:
-            return False
+    elif is_macos():
+        if get_launchd_plist_path(system=False).exists():
+            try:
+                result = subprocess.run(
+                    ["launchctl", "list", get_launchd_label(system=False)],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if result.returncode == 0:
+                    return True
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+        if get_launchd_plist_path(system=True).exists():
+            target = f"{_launchd_domain(system=True)}/{get_launchd_label(system=True)}"
+            try:
+                result = subprocess.run(
+                    ["launchctl", "print", target],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if result.returncode == 0:
+                    return True
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+        return len(find_gateway_pids()) > 0
     elif is_windows():
         from hermes_cli import gateway_windows
         if gateway_windows.is_installed():
@@ -5066,7 +6029,7 @@ def _gateway_command_inner(args):
                 print()
             systemd_install(force=force, system=system, run_as_user=run_as_user)
         elif is_macos():
-            launchd_install(force)
+            launchd_install(force=force, system=system, run_as_user=run_as_user)
         elif is_windows():
             from hermes_cli import gateway_windows
             gateway_windows.install(force=force)
@@ -5105,7 +6068,7 @@ def _gateway_command_inner(args):
         if supports_systemd_services():
             systemd_uninstall(system=system)
         elif is_macos():
-            launchd_uninstall()
+            launchd_uninstall(system=system)
         elif is_windows():
             from hermes_cli import gateway_windows
             gateway_windows.uninstall()
@@ -5138,7 +6101,7 @@ def _gateway_command_inner(args):
         if supports_systemd_services():
             systemd_start(system=system)
         elif is_macos():
-            launchd_start()
+            launchd_start(system=system)
         elif is_windows():
             from hermes_cli import gateway_windows
             gateway_windows.start()
@@ -5178,12 +6141,9 @@ def _gateway_command_inner(args):
                     service_available = True
                 except subprocess.CalledProcessError:
                     pass
-            elif is_macos() and get_launchd_plist_path().exists():
-                try:
-                    launchd_stop()
-                    service_available = True
-                except subprocess.CalledProcessError:
-                    pass
+            elif is_macos() and _has_installed_launchd_scope():
+                stopped = _launchd_stop_all_scopes()
+                service_available = stopped > 0
             elif is_windows():
                 from hermes_cli import gateway_windows
                 if gateway_windows.is_installed():
@@ -5207,9 +6167,12 @@ def _gateway_command_inner(args):
                     service_available = True
                 except subprocess.CalledProcessError:
                     pass
-            elif is_macos() and get_launchd_plist_path().exists():
+            elif is_macos() and (
+                get_launchd_plist_path(system=False).exists()
+                or get_launchd_plist_path(system=True).exists()
+            ):
                 try:
-                    launchd_stop()
+                    launchd_stop(system=system)
                     service_available = True
                 except subprocess.CalledProcessError:
                     pass
@@ -5247,12 +6210,9 @@ def _gateway_command_inner(args):
                     service_stopped = True
                 except subprocess.CalledProcessError:
                     pass
-            elif is_macos() and get_launchd_plist_path().exists():
-                try:
-                    launchd_stop()
-                    service_stopped = True
-                except subprocess.CalledProcessError:
-                    pass
+            elif is_macos() and _has_installed_launchd_scope():
+                stopped = _launchd_stop_all_scopes()
+                service_stopped = stopped > 0
             elif is_windows():
                 from hermes_cli import gateway_windows
                 if gateway_windows.is_installed():
@@ -5271,8 +6231,11 @@ def _gateway_command_inner(args):
             print("Starting gateway...")
             if supports_systemd_services() and (get_systemd_unit_path(system=False).exists() or get_systemd_unit_path(system=True).exists()):
                 systemd_start(system=system)
-            elif is_macos() and get_launchd_plist_path().exists():
-                launchd_start()
+            elif is_macos() and (
+                get_launchd_plist_path(system=False).exists()
+                or get_launchd_plist_path(system=True).exists()
+            ):
+                launchd_start(system=system)
             elif is_windows():
                 from hermes_cli import gateway_windows
                 # On Windows, even without a registered Scheduled Task / Startup
@@ -5285,7 +6248,7 @@ def _gateway_command_inner(args):
             else:
                 run_gateway(verbose=0)
             return
-        
+
         if supports_systemd_services() and (get_systemd_unit_path(system=False).exists() or get_systemd_unit_path(system=True).exists()):
             service_configured = True
             try:
@@ -5293,10 +6256,13 @@ def _gateway_command_inner(args):
                 service_available = True
             except subprocess.CalledProcessError:
                 pass
-        elif is_macos() and get_launchd_plist_path().exists():
+        elif is_macos() and (
+            get_launchd_plist_path(system=False).exists()
+            or get_launchd_plist_path(system=True).exists()
+        ):
             service_configured = True
             try:
-                launchd_restart()
+                launchd_restart(system=system)
                 service_available = True
             except subprocess.CalledProcessError:
                 pass
@@ -5364,8 +6330,11 @@ def _gateway_command_inner(args):
         if supports_systemd_services() and (get_systemd_unit_path(system=False).exists() or get_systemd_unit_path(system=True).exists()):
             systemd_status(deep, system=system, full=full)
             _print_gateway_process_mismatch(snapshot)
-        elif is_macos() and get_launchd_plist_path().exists():
-            launchd_status(deep)
+        elif is_macos() and (
+            get_launchd_plist_path(system=False).exists()
+            or get_launchd_plist_path(system=True).exists()
+        ):
+            launchd_status(deep, system=system)
             _print_gateway_process_mismatch(snapshot)
         elif _windows_service_installed:
             from hermes_cli import gateway_windows

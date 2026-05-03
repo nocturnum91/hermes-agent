@@ -581,6 +581,33 @@ class ShellFileOperations(FileOperations):
             result = self._exec(f"command -v {cmd} >/dev/null 2>&1 && echo 'yes'")
             self._command_cache[cmd] = result.stdout.strip() == 'yes'
         return self._command_cache[cmd]
+
+    def _check_git_baseline(self, path: str) -> Optional[str]:
+        """Warn when writing into a dirty git worktree.
+
+        The file-operation tool can overwrite files in any terminal backend.
+        A lightweight git status warning helps the agent avoid mixing an edit
+        with unrelated user changes while staying best-effort for non-git
+        directories and minimal shell environments.
+        """
+        if not self._has_command("git"):
+            return None
+
+        target_dir = os.path.dirname(path) or "."
+        inside = self._exec("git rev-parse --is-inside-work-tree", cwd=target_dir)
+        if inside.exit_code != 0 or inside.stdout.strip().lower() != "true":
+            return None
+
+        branch_result = self._exec("git rev-parse --abbrev-ref HEAD", cwd=target_dir)
+        branch = branch_result.stdout.strip() if branch_result.exit_code == 0 else "unknown"
+        status = self._exec("git status --porcelain", cwd=target_dir)
+        if status.exit_code != 0 or not status.stdout.strip():
+            return None
+
+        return (
+            f"Git working tree is dirty on branch {branch}; "
+            "verify unrelated user changes before committing."
+        )
     
     def _is_likely_binary(self, path: str, content_sample: str = None) -> bool:
         """
@@ -905,6 +932,8 @@ class ShellFileOperations(FileOperations):
         # Expand ~ and other shell paths
         path = self._expand_path(path)
 
+        git_warning = self._check_git_baseline(path)
+
         # Block writes to sensitive paths
         if _is_write_denied(path):
             return WriteResult(error=f"Write denied: '{path}' is a protected system/credential file.")
@@ -993,6 +1022,7 @@ class ShellFileOperations(FileOperations):
             dirs_created=dirs_created,
             lint=lint_result.to_dict() if lint_result else None,
             lsp_diagnostics=lsp_diagnostics,
+            warning=git_warning,
         )
     
     # =========================================================================

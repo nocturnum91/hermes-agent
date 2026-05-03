@@ -7,6 +7,7 @@ Provides options for:
 """
 
 import os
+import platform
 import shutil
 import subprocess
 from pathlib import Path
@@ -191,13 +192,41 @@ def uninstall_gateway_service():
     # 3. macOS: uninstall launchd plist
     elif system == "Darwin":
         try:
-            from hermes_cli.gateway import get_launchd_plist_path
-            plist_path = get_launchd_plist_path()
-            if plist_path.exists():
+            from hermes_cli.gateway import get_launchd_label, get_launchd_plist_path
+
+            sudo_user_info = _macos_sudo_user_info() if os.geteuid() == 0 else None  # windows-footgun: ok — Darwin-only launchd uninstall path
+            for is_system in (False, True):
+                label = get_launchd_label(system=is_system)
+                if not is_system and sudo_user_info is not None:
+                    sudo_uid, sudo_home = sudo_user_info
+                    plist_path = sudo_home / "Library" / "LaunchAgents" / f"{label}.plist"
+                    domain = f"gui/{sudo_uid}"
+                else:
+                    plist_path = get_launchd_plist_path(system=is_system)
+                    domain = "system" if is_system else f"gui/{os.getuid()}"  # windows-footgun: ok — Darwin-only launchd uninstall path
+
+                if not plist_path.exists():
+                    continue
+
+                scope = "system LaunchDaemon" if is_system else "user LaunchAgent"
+                if is_system and os.geteuid() != 0:  # windows-footgun: ok — Darwin-only launchd uninstall path
+                    log_warn(
+                        f"macOS {scope} exists at {plist_path} but needs sudo to remove"
+                    )
+                    log_warn("Re-run `sudo hermes uninstall` before removing code or data.")
+                    raise SystemExit(1)
+
+                subprocess.run(
+                    ["launchctl", "bootout", f"{domain}/{label}"],
+                    capture_output=True,
+                    check=False,
+                )
+                # Older launchctl accepts unload-by-plist and it is harmless as
+                # a fallback if bootout reported that the service was not loaded.
                 subprocess.run(["launchctl", "unload", str(plist_path)],
                                capture_output=True, check=False)
                 plist_path.unlink()
-                log_success(f"Removed macOS gateway service ({plist_path})")
+                log_success(f"Removed macOS {scope} ({plist_path})")
                 stopped_something = True
         except Exception as e:
             log_warn(f"Could not remove launchd gateway service: {e}")
@@ -383,6 +412,82 @@ def _discover_named_profiles():
         return []
 
 
+def _profile_launchdaemon_path(profile_home: Path) -> Path | None:
+    """Return this profile's macOS system LaunchDaemon plist path, if resolvable."""
+    old_home = os.environ.get("HERMES_HOME")
+    try:
+        os.environ["HERMES_HOME"] = str(profile_home)
+        from hermes_cli.gateway import get_launchd_plist_path
+
+        return get_launchd_plist_path(system=True)
+    except (ImportError, OSError):
+        return None
+    finally:
+        if old_home is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = old_home
+
+
+def _profile_launchagent_path(profile_home: Path, user_home: Path | None = None) -> Path | None:
+    """Return this profile's macOS user LaunchAgent plist path, if resolvable."""
+    old_home = os.environ.get("HERMES_HOME")
+    try:
+        os.environ["HERMES_HOME"] = str(profile_home)
+        from hermes_cli.gateway import get_launchd_label, get_launchd_plist_path
+
+        if user_home is not None:
+            return user_home / "Library" / "LaunchAgents" / f"{get_launchd_label(system=False)}.plist"
+        return get_launchd_plist_path(system=False)
+    except (ImportError, OSError):
+        return None
+    finally:
+        if old_home is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = old_home
+
+
+def _macos_sudo_user() -> str | None:
+    user = str(os.environ.get("SUDO_USER") or "").strip()
+    if not user or user == "root":
+        return None
+    return user
+
+
+def _macos_sudo_user_info() -> tuple[int, Path] | None:
+    """Return the original GUI user's uid/home when running under sudo.
+
+    Root-owned launchd cleanup must remove system LaunchDaemons as root, but
+    user LaunchAgents still live in the sudo user's home and gui/<uid> domain.
+    """
+    user = _macos_sudo_user()
+    if not user:
+        return None
+    try:
+        import pwd
+
+        pw = pwd.getpwnam(user)  # windows-footgun: ok — Darwin-only sudo launchd cleanup helper
+    except (KeyError, ImportError, OSError):
+        return None
+    return int(pw.pw_uid), Path(pw.pw_dir)
+
+
+def _preflight_named_profile_launchdaemons(named_profiles) -> None:
+    """Abort before destructive uninstall if profile LaunchDaemons need sudo."""
+    if platform.system() != "Darwin" or os.geteuid() == 0:  # windows-footgun: ok — Darwin-only LaunchDaemon cleanup path
+        return
+    for profile in named_profiles:
+        daemon_path = _profile_launchdaemon_path(profile.path)
+        if daemon_path is not None and daemon_path.exists():
+            log_warn(
+                f"Profile '{profile.name}' has a system LaunchDaemon at {daemon_path} "
+                "that needs sudo to remove"
+            )
+            log_warn("Re-run `sudo hermes uninstall` before removing code or data.")
+            raise SystemExit(1)
+
+
 def _uninstall_profile(profile) -> None:
     """Fully uninstall a single named profile: stop its gateway service,
     remove its alias wrapper, and wipe its HERMES_HOME directory.
@@ -397,23 +502,72 @@ def _uninstall_profile(profile) -> None:
 
     log_info(f"Uninstalling profile '{name}'...")
 
+    if platform.system() == "Darwin":
+        daemon_path = _profile_launchdaemon_path(profile_home)
+        if daemon_path is not None and daemon_path.exists() and os.geteuid() != 0:  # windows-footgun: ok — Darwin-only LaunchDaemon cleanup path
+            log_warn(
+                f"  System LaunchDaemon exists at {daemon_path} but needs sudo to remove"
+            )
+            log_warn("  Re-run `sudo hermes uninstall` before deleting this profile.")
+            raise SystemExit(1)
+
     # 1. Stop and remove this profile's gateway service.
     #    Use `python -m hermes_cli.main` so we don't depend on a `hermes`
     #    wrapper that may be half-removed mid-uninstall.
+    profile_env = os.environ.copy()
+    profile_env["HERMES_HOME"] = str(profile_home)
     hermes_invocation = [_sys.executable, "-m", "hermes_cli.main", "--profile", name]
-    for subcmd in ("stop", "uninstall"):
+    command_variants = []
+    sudo_user = _macos_sudo_user() if platform.system() == "Darwin" and os.geteuid() == 0 else None  # windows-footgun: ok — Darwin-only LaunchDaemon cleanup path
+    if sudo_user:
+        user_invocation = [
+            "sudo",
+            "-u",
+            sudo_user,
+            "env",
+            f"HERMES_HOME={profile_home}",
+        ] + hermes_invocation
+        sudo_info = _macos_sudo_user_info()
+        user_agent_path = _profile_launchagent_path(
+            profile_home,
+            sudo_info[1] if sudo_info is not None else None,
+        )
+        if user_agent_path is not None and user_agent_path.exists():
+            command_variants.extend((user_invocation, subcmd, [], None) for subcmd in ("stop", "uninstall"))
+        command_variants.extend((hermes_invocation, subcmd, ["--system"], profile_env) for subcmd in ("stop", "uninstall"))
+    else:
+        command_variants.extend((hermes_invocation, subcmd, [], profile_env) for subcmd in ("stop", "uninstall"))
+        if platform.system() == "Darwin" and os.geteuid() == 0:  # windows-footgun: ok — Darwin-only LaunchDaemon cleanup path
+            command_variants.extend((hermes_invocation, subcmd, ["--system"], profile_env) for subcmd in ("stop", "uninstall"))
+    uninstall_failed = False
+    for invocation, subcmd, extra_args, env in command_variants:
         try:
-            subprocess.run(
-                hermes_invocation + ["gateway", subcmd],
+            result = subprocess.run(
+                invocation + ["gateway", subcmd] + extra_args,
                 capture_output=True,
                 text=True,
                 timeout=60,
                 check=False,
+                env=env,
             )
+            if subcmd == "uninstall" and result.returncode != 0:
+                uninstall_failed = True
+                detail = (result.stderr or result.stdout or "").strip()
+                suffix = f": {detail}" if detail else ""
+                log_warn(f"  Gateway uninstall failed for '{name}'{suffix}")
         except subprocess.TimeoutExpired:
             log_warn(f"  Gateway {subcmd} timed out for '{name}'")
+            if subcmd == "uninstall":
+                uninstall_failed = True
         except Exception as e:
             log_warn(f"  Could not run gateway {subcmd} for '{name}': {e}")
+            if subcmd == "uninstall":
+                uninstall_failed = True
+
+    if uninstall_failed:
+        raise SystemExit(
+            f"Gateway service uninstall failed for profile '{name}'; refusing to delete {profile_home}"
+        )
 
     # 2. Remove the wrapper alias script at ~/.local/bin/<name> (if any).
     alias_path = getattr(profile, "alias_path", None)
@@ -549,11 +703,22 @@ def run_uninstall(args):
     print()
     print(color("Uninstalling...", Colors.CYAN, Colors.BOLD))
     print()
+
+    if full_uninstall and remove_profiles and named_profiles:
+        _preflight_named_profile_launchdaemons(named_profiles)
     
     # 1. Stop and uninstall gateway service + kill standalone processes
     log_info("Checking for running gateway...")
     if not uninstall_gateway_service():
         log_info("No gateway service or processes found")
+
+    # 1b. Stop and remove each named profile's gateway service and alias
+    #     wrapper before deleting this checkout. _uninstall_profile() shells
+    #     out through `python -m hermes_cli.main`, so doing this after the code
+    #     rmtree can leave a half-uninstalled profile cleanup path.
+    if full_uninstall and remove_profiles and named_profiles:
+        for prof in named_profiles:
+            _uninstall_profile(prof)
     
     # 2. Remove PATH entries from shell configs (POSIX) AND from the Windows
     #    User-scope registry.  Both helpers no-op on the wrong platform so we
@@ -629,17 +794,8 @@ def run_uninstall(args):
         else:
             log_info("No Windows installer artifacts to remove")
     
-    # 5. Optionally remove ~/.hermes/ data directory (and named profiles)
+    # 5. Optionally remove ~/.hermes/ data directory.
     if full_uninstall:
-        # 5a. Stop and remove each named profile's gateway service and
-        #     alias wrapper. The profile HERMES_HOME dirs live under
-        #     ``<default>/profiles/<name>/`` and will be swept away by the
-        #     rmtree below, but services + alias scripts live OUTSIDE the
-        #     default root and have to be cleaned up explicitly.
-        if remove_profiles and named_profiles:
-            for prof in named_profiles:
-                _uninstall_profile(prof)
-
         log_info("Removing configuration and data...")
         try:
             if hermes_home.exists():

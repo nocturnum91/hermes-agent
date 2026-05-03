@@ -11,6 +11,7 @@ import os
 import tarfile
 from pathlib import Path
 from unittest.mock import patch, MagicMock
+from types import SimpleNamespace
 
 import pytest
 
@@ -442,6 +443,41 @@ class TestDeleteProfile:
     def test_nonexistent_raises_file_not_found(self, profile_env):
         with pytest.raises(FileNotFoundError):
             delete_profile("nonexistent", yes=True)
+
+    def test_root_delete_removes_original_user_launchagent_when_sudo(self, profile_env, monkeypatch, tmp_path):
+        import hermes_cli.profiles as profiles_mod
+
+        profile_dir = create_profile("coder", no_alias=True)
+        user_home = tmp_path / "alice-home"
+        agent_dir = user_home / "Library" / "LaunchAgents"
+        agent_dir.mkdir(parents=True)
+        agent_plist = agent_dir / "ai.hermes.gateway-coder.plist"
+        agent_plist.write_text("plist", encoding="utf-8")
+        daemon_plist = tmp_path / "ai.hermes.daemon-coder.plist"
+        daemon_plist.write_text("plist", encoding="utf-8")
+
+        run_mock = MagicMock()
+        monkeypatch.setattr(profiles_mod, "subprocess", SimpleNamespace(run=run_mock))
+        monkeypatch.setattr(profiles_mod.os, "geteuid", lambda: 0, raising=False)
+        monkeypatch.setenv("SUDO_USER", "alice")
+        monkeypatch.setattr("platform.system", lambda: "Darwin")
+        monkeypatch.setattr("pwd.getpwnam", lambda _user: SimpleNamespace(pw_uid=501, pw_dir=str(user_home)))
+
+        def fake_launchd_path(system=False):
+            return daemon_plist if system else tmp_path / "root" / "Library" / "LaunchAgents" / "ai.hermes.gateway-coder.plist"
+
+        monkeypatch.setattr("hermes_cli.gateway.get_launchd_plist_path", fake_launchd_path)
+        monkeypatch.setattr(
+            "hermes_cli.gateway.get_launchd_label",
+            lambda system=False: "ai.hermes.daemon-coder" if system else "ai.hermes.gateway-coder",
+        )
+
+        delete_profile("coder", yes=True)
+
+        calls = run_mock.call_args_list
+        assert any(call.args[0] == ["launchctl", "bootout", "gui/501/ai.hermes.gateway-coder"] for call in calls)
+        assert any(call.args[0] == ["launchctl", "bootout", "system/ai.hermes.daemon-coder"] for call in calls)
+        assert not profile_dir.exists()
 
 
 # ===================================================================
