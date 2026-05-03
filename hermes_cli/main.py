@@ -7886,6 +7886,49 @@ def _run_pre_update_backup(args) -> None:
     print()
 
 
+def _wait_for_launchd_daemon_relaunch(
+    target: str, old_pid: int, timeout: float = 20.0,
+) -> bool:
+    """Poll ``launchctl print <target>`` until launchd reports a fresh pid.
+
+    After SIGUSR1 + drain, the gateway exits 0 and launchd's
+    ``KeepAlive=SuccessfulExit=false`` policy respawns it after at most
+    ``ThrottleInterval`` (default 10s).  A naive ``Restarted`` claim
+    immediately after drain masks the case where the relaunch never happens
+    (plist unloaded concurrently, KeepAlive policy left the job idle, or
+    the new process crashed during init).  Poll until we see a pid that is
+    > 0 and different from ``old_pid``, or ``timeout`` elapses.
+
+    Module-level so tests can patch it without poking into ``cmd_update``'s
+    local scope.
+    """
+    import re as _re_local
+
+    deadline = _time.monotonic() + max(timeout, 0.5)
+    while True:
+        try:
+            verify = subprocess.run(
+                ["launchctl", "print", target],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            verify = None
+        if verify is not None and verify.returncode == 0:
+            for line in (verify.stdout or "").splitlines():
+                m = _re_local.match(r"\s*pid\s*=\s*(\d+)", line)
+                if m:
+                    try:
+                        new_pid = int(m.group(1))
+                    except ValueError:
+                        new_pid = 0
+                    if new_pid > 0 and new_pid != old_pid:
+                        return True
+                    break
+        if _time.monotonic() >= deadline:
+            return False
+        _time.sleep(0.5)
+
+
 def cmd_update(args):
     """Update Hermes Agent to the latest version.
 
@@ -8853,26 +8896,83 @@ def _cmd_update_impl(args, gateway_mode: bool):
             if is_macos():
                 try:
                     from hermes_cli.gateway import (
-                        launchd_restart,
                         get_launchd_label,
                         get_launchd_plist_path,
+                        get_launchd_daemon_label,
+                        get_launchd_daemon_plist_path,
+                        _installed_launchd_user_agent_labels,
+                        _installed_launchd_system_daemon_labels,
+                        _launchd_domain,
+                        _launchd_system_domain,
+                        _parse_launchctl_print_pid,
                     )
 
-                    plist_path = get_launchd_plist_path()
-                    if plist_path.exists():
+                    user_domain = _launchd_domain(system=False)
+                    for label in sorted(_installed_launchd_user_agent_labels()):
                         check = subprocess.run(
-                            ["launchctl", "list", get_launchd_label()],
+                            ["launchctl", "list", label],
                             capture_output=True,
                             text=True,
                             timeout=5,
                         )
-                        if check.returncode == 0:
-                            try:
-                                launchd_restart()
-                                restarted_services.append(get_launchd_label())
-                            except subprocess.CalledProcessError as e:
-                                stderr = (getattr(e, "stderr", "") or "").strip()
-                                print(f"  ⚠ Gateway restart failed: {stderr}")
+                        if check.returncode != 0:
+                            continue
+                        target = f"{user_domain}/{label}"
+                        try:
+                            restart = subprocess.run(
+                                ["launchctl", "kickstart", "-k", target],
+                                capture_output=True,
+                                text=True,
+                                timeout=15,
+                                check=True,
+                            )
+                            restarted_services.append(label)
+                        except subprocess.CalledProcessError as e:
+                            stderr = (getattr(e, "stderr", "") or "").strip()
+                            print(f"  ⚠ Gateway restart failed for {label}: {stderr}")
+
+                    for daemon_label in sorted(_installed_launchd_system_daemon_labels()):
+                        daemon_target = f"{_launchd_system_domain()}/{daemon_label}"
+                        check = subprocess.run(
+                            ["launchctl", "print", daemon_target],
+                            capture_output=True,
+                            text=True,
+                            timeout=5,
+                        )
+                        if check.returncode != 0:
+                            continue
+                        daemon_pid = _parse_launchctl_print_pid(check.stdout or "") or 0
+                        if daemon_pid > 0:
+                            print(
+                                f"  → {daemon_label}: draining (up to {int(_drain_budget)}s)..."
+                            )
+                            if _graceful_restart_via_sigusr1(
+                                daemon_pid, drain_timeout=_drain_budget,
+                            ):
+                                # SIGUSR1 drained the OLD pid, but launchd may
+                                # take a few seconds (ThrottleInterval default
+                                # 10s) to relaunch.  Don't claim "Restarted"
+                                # until `launchctl print` reports a fresh,
+                                # running pid — otherwise we mask the case
+                                # where KeepAlive left the job unloaded.
+                                if _wait_for_launchd_daemon_relaunch(
+                                    daemon_target,
+                                    old_pid=daemon_pid,
+                                    timeout=20.0,
+                                ):  # noqa: F821 — module-level helper
+                                    restarted_services.append(daemon_label)
+                                else:
+                                    print(
+                                        f"  ⚠ {daemon_label} drained but launchd did not relaunch a new pid; retry manually: sudo hermes gateway restart --system"
+                                    )
+                            else:
+                                print(
+                                    f"  ⚠ {daemon_label} did not drain; retry manually: sudo hermes gateway restart --system"
+                                )
+                        else:
+                            print(
+                                f"  ⚠ {daemon_label} is loaded but no pid was reported; retry manually: sudo hermes gateway restart --system"
+                            )
                 except (FileNotFoundError, subprocess.TimeoutExpired, ImportError):
                     pass
 
@@ -10154,7 +10254,7 @@ def main():
     gateway_start.add_argument(
         "--system",
         action="store_true",
-        help="Target the Linux system-level gateway service",
+        help="Target the system-level gateway service (Linux systemd or macOS LaunchDaemon)",
     )
     gateway_start.add_argument(
         "--all",
@@ -10167,7 +10267,7 @@ def main():
     gateway_stop.add_argument(
         "--system",
         action="store_true",
-        help="Target the Linux system-level gateway service",
+        help="Target the system-level gateway service (Linux systemd or macOS LaunchDaemon)",
     )
     gateway_stop.add_argument(
         "--all",
@@ -10182,7 +10282,7 @@ def main():
     gateway_restart.add_argument(
         "--system",
         action="store_true",
-        help="Target the Linux system-level gateway service",
+        help="Target the system-level gateway service (Linux systemd or macOS LaunchDaemon)",
     )
     gateway_restart.add_argument(
         "--all",
@@ -10202,7 +10302,7 @@ def main():
     gateway_status.add_argument(
         "--system",
         action="store_true",
-        help="Target the Linux system-level gateway service",
+        help="Target the system-level gateway service (Linux systemd or macOS LaunchDaemon)",
     )
 
     # gateway install
@@ -10213,12 +10313,12 @@ def main():
     gateway_install.add_argument(
         "--system",
         action="store_true",
-        help="Install as a Linux system-level service (starts at boot)",
+        help="Install as a system-level service that starts at boot (Linux systemd or macOS LaunchDaemon)",
     )
     gateway_install.add_argument(
         "--run-as-user",
         dest="run_as_user",
-        help="User account the Linux system service should run as",
+        help="User account the system service should run as (Linux systemd or macOS LaunchDaemon)",
     )
 
     # gateway uninstall
@@ -10228,7 +10328,7 @@ def main():
     gateway_uninstall.add_argument(
         "--system",
         action="store_true",
-        help="Target the Linux system-level gateway service",
+        help="Target the system-level gateway service (Linux systemd or macOS LaunchDaemon)",
     )
 
     # gateway list

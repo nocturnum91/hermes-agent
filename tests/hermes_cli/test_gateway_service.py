@@ -67,6 +67,7 @@ class TestSystemdServiceRefresh:
 
         monkeypatch.setattr(gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path)
         monkeypatch.setattr(gateway_cli, "generate_systemd_unit", lambda system=False, run_as_user=None: "new unit\n")
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda **_: None)
 
         calls = []
 
@@ -90,6 +91,7 @@ class TestSystemdServiceRefresh:
 
         monkeypatch.setattr(gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path)
         monkeypatch.setattr(gateway_cli, "generate_systemd_unit", lambda system=False, run_as_user=None: "new unit\n")
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda **_: None)
 
         calls = []
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
@@ -327,7 +329,7 @@ class TestGeneratedSystemdUnits:
         assert "ExecStop=" not in unit
         assert "ExecReload=/bin/kill -USR1 $MAINPID" in unit
         assert f"RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}" in unit
-        # TimeoutStopSec must exceed the default drain_timeout (60s) so
+        # TimeoutStopSec must exceed the default drain_timeout (180s) so
         # systemd doesn't SIGKILL the cgroup before post-interrupt cleanup
         # (tool subprocess kill, adapter disconnect) runs — issue #8202.
         assert self._expected_timeout_stop_sec() in unit
@@ -388,7 +390,7 @@ class TestGeneratedSystemdUnits:
         assert "ExecStop=" not in unit
         assert "ExecReload=/bin/kill -USR1 $MAINPID" in unit
         assert f"RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}" in unit
-        # TimeoutStopSec must exceed the default drain_timeout (60s) so
+        # TimeoutStopSec must exceed the default drain_timeout (180s) so
         # systemd doesn't SIGKILL the cgroup before post-interrupt cleanup
         # (tool subprocess kill, adapter disconnect) runs — issue #8202.
         assert self._expected_timeout_stop_sec() in unit
@@ -479,7 +481,9 @@ class TestLaunchdServiceRecovery:
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text("<plist>old content</plist>", encoding="utf-8")
 
-        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_plist_path", lambda system=False: plist_path
+        )
 
         calls = []
 
@@ -515,7 +519,7 @@ class TestLaunchdServiceRecovery:
                 raise gateway_cli.subprocess.CalledProcessError(3, cmd, stderr="Could not find service")
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda system=False: plist_path)
         monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
 
         gateway_cli.launchd_start()
@@ -543,7 +547,7 @@ class TestLaunchdServiceRecovery:
                 raise gateway_cli.subprocess.CalledProcessError(113, cmd, stderr="Could not find service")
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda system=False: plist_path)
         monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
 
         gateway_cli.launchd_start()
@@ -664,7 +668,7 @@ class TestLaunchdServiceRecovery:
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text("<plist>old content</plist>", encoding="utf-8")
 
-        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda system=False: plist_path)
         monkeypatch.setattr(
             gateway_cli.subprocess,
             "run",
@@ -741,6 +745,7 @@ class TestGatewaySystemServiceRouting:
         calls = []
 
         monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda **_: None)
         monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: calls.append(("refresh", system)))
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 12.0)
@@ -786,6 +791,7 @@ class TestGatewaySystemServiceRouting:
         calls = []
 
         monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda **_: None)
         monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: None)
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 10.0)
@@ -845,6 +851,7 @@ class TestGatewaySystemServiceRouting:
         calls = []
 
         monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda **_: None)
         monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: None)
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
@@ -875,6 +882,7 @@ class TestGatewaySystemServiceRouting:
 
     def test_systemd_restart_recovers_failed_planned_restart(self, monkeypatch, capsys):
         monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda **_: None)
         monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: None)
         monkeypatch.setattr(
@@ -1115,11 +1123,11 @@ class TestGatewaySystemServiceRouting:
 
         monkeypatch.setattr(gateway_cli, "is_linux", lambda: False)
         monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
-        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda system=False: plist_path)
         monkeypatch.setattr(
             gateway_cli,
             "launchd_restart",
-            lambda: (_ for _ in ()).throw(
+            lambda system=False: (_ for _ in ()).throw(
                 gateway_cli.subprocess.CalledProcessError(5, ["launchctl", "kickstart", "-k", "gui/501/ai.hermes.gateway"])
             ),
         )
@@ -2551,3 +2559,1632 @@ class TestGatewayCommandCatchesSystemScopeError:
         # Renders the message, NOT the ``('msg', 'action')`` tuple repr
         assert "System gateway start requires root. Re-run with sudo." in out
         assert "('" not in out  # no tuple repr leaking through
+
+
+class TestLaunchdSystemDaemon:
+    """macOS gateway status must recognize system LaunchDaemons, not only the user agent."""
+
+    def _force_macos(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_linux", lambda: False)
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway_cli, "find_gateway_pids", lambda: [])
+
+    def test_daemon_label_and_path_use_profile_suffix(self, tmp_path, monkeypatch):
+        profile_dir = tmp_path / ".hermes" / "profiles" / "company"
+        profile_dir.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(profile_dir))
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: profile_dir)
+
+        assert gateway_cli.get_launchd_daemon_label() == "ai.hermes.daemon-company"
+        assert gateway_cli.get_launchd_daemon_plist_path() == Path(
+            "/Library/LaunchDaemons/ai.hermes.daemon-company.plist"
+        )
+
+    def test_daemon_label_default_profile(self, tmp_path, monkeypatch):
+        # Default HERMES_HOME (~/.hermes) → no suffix.
+        from hermes_constants import get_default_hermes_root
+
+        default_home = get_default_hermes_root()
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: default_home)
+        assert gateway_cli.get_launchd_daemon_label() == "ai.hermes.daemon"
+        assert gateway_cli.get_launchd_daemon_plist_path() == Path(
+            "/Library/LaunchDaemons/ai.hermes.daemon.plist"
+        )
+
+    def test_snapshot_recognizes_loaded_system_daemon_without_user_agent(
+        self, tmp_path, monkeypatch
+    ):
+        self._force_macos(monkeypatch)
+
+        agent_plist = tmp_path / "ai.hermes.gateway.plist"  # does not exist
+        daemon_plist = tmp_path / "ai.hermes.daemon-nocturnum.plist"
+        daemon_plist.write_text("<plist/>", encoding="utf-8")
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda system=False: agent_plist)
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_daemon_plist_path", lambda: daemon_plist
+        )
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_daemon_label", lambda: "ai.hermes.daemon-nocturnum"
+        )
+
+        recorded = []
+
+        def fake_run(cmd, capture_output=True, text=True, timeout=10, **kwargs):
+            recorded.append(list(cmd))
+            if cmd[:2] == ["launchctl", "print"]:
+                return SimpleNamespace(returncode=0, stdout="loaded\n", stderr="")
+            return SimpleNamespace(returncode=113, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        snapshot = gateway_cli.get_gateway_runtime_snapshot()
+
+        assert snapshot.service_installed is True
+        assert snapshot.service_running is True
+        assert snapshot.service_scope == "launchd-system"
+        assert "system" in snapshot.manager
+        # Probe must be read-only (no sudo, uses `launchctl print system/...`).
+        assert any(
+            cmd[:2] == ["launchctl", "print"] and cmd[2] == "system/ai.hermes.daemon-nocturnum"
+            for cmd in recorded
+        )
+        assert not any("sudo" in part for cmd in recorded for part in cmd)
+
+    def test_snapshot_marks_daemon_installed_but_not_running(self, tmp_path, monkeypatch):
+        self._force_macos(monkeypatch)
+
+        agent_plist = tmp_path / "ai.hermes.gateway.plist"  # does not exist
+        daemon_plist = tmp_path / "ai.hermes.daemon.plist"
+        daemon_plist.write_text("<plist/>", encoding="utf-8")
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda system=False: agent_plist)
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_daemon_plist_path", lambda: daemon_plist
+        )
+
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *a, **kw: SimpleNamespace(
+                returncode=113, stdout="", stderr="Could not find service"
+            ),
+        )
+
+        snapshot = gateway_cli.get_gateway_runtime_snapshot()
+
+        assert snapshot.service_installed is True
+        assert snapshot.service_running is False
+        assert snapshot.service_scope == "launchd-system"
+
+    def test_snapshot_prefers_running_user_agent_over_stopped_daemon(
+        self, tmp_path, monkeypatch
+    ):
+        """Mixed install: both plists present, only the user agent is loaded.
+        Snapshot must reflect the live owner (agent), not the dormant daemon."""
+        self._force_macos(monkeypatch)
+
+        agent_plist = tmp_path / "ai.hermes.gateway.plist"
+        agent_plist.write_text("<plist/>", encoding="utf-8")
+        daemon_plist = tmp_path / "ai.hermes.daemon-nocturnum.plist"
+        daemon_plist.write_text("<plist/>", encoding="utf-8")
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda system=False: agent_plist)
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_daemon_plist_path", lambda: daemon_plist
+        )
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_daemon_label", lambda: "ai.hermes.daemon-nocturnum"
+        )
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["launchctl", "list"]:
+                return SimpleNamespace(returncode=0, stdout="loaded\n", stderr="")
+            if cmd[:2] == ["launchctl", "print"]:
+                return SimpleNamespace(returncode=113, stdout="", stderr="not loaded")
+            return SimpleNamespace(returncode=113, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        snapshot = gateway_cli.get_gateway_runtime_snapshot()
+
+        assert snapshot.service_installed is True
+        assert snapshot.service_running is True
+        assert snapshot.manager == "launchd"
+        assert snapshot.service_scope == "launchd"
+
+    def test_snapshot_unchanged_when_neither_agent_nor_daemon_installed(
+        self, tmp_path, monkeypatch
+    ):
+        self._force_macos(monkeypatch)
+
+        agent_plist = tmp_path / "ai.hermes.gateway.plist"
+        daemon_plist = tmp_path / "ai.hermes.daemon.plist"
+        # Neither file is created.
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda system=False: agent_plist)
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_daemon_plist_path", lambda: daemon_plist
+        )
+
+        ran = []
+
+        def fake_run(cmd, **kwargs):
+            ran.append(list(cmd))
+            return SimpleNamespace(returncode=113, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        snapshot = gateway_cli.get_gateway_runtime_snapshot()
+
+        assert snapshot.service_installed is False
+        assert snapshot.service_running is False
+        assert snapshot.service_scope == "launchd"
+        # Both probes short-circuit on the missing plist files — no launchctl
+        # subprocess should be invoked at all.
+        assert ran == []
+
+    def test_launchd_status_reports_loaded_system_daemon(self, tmp_path, monkeypatch, capsys):
+        self._force_macos(monkeypatch)
+
+        agent_plist = tmp_path / "ai.hermes.gateway.plist"  # absent
+        daemon_plist = tmp_path / "ai.hermes.daemon-nocturnum.plist"
+        daemon_plist.write_text("<plist/>", encoding="utf-8")
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda system=False: agent_plist)
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_daemon_plist_path", lambda: daemon_plist
+        )
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_daemon_label", lambda: "ai.hermes.daemon-nocturnum"
+        )
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["launchctl", "print"]:
+                return SimpleNamespace(returncode=0, stdout="loaded", stderr="")
+            return SimpleNamespace(returncode=113, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        gateway_cli.launchd_status()
+
+        out = capsys.readouterr().out
+        assert "System LaunchDaemon" in out
+        assert "ai.hermes.daemon-nocturnum" in out
+        assert "is loaded" in out
+        # Should not falsely claim the user-agent is unloaded when no agent
+        # plist exists.
+        assert "User LaunchAgent is not loaded" not in out
+
+    def test_launchd_status_mixed_install_does_not_flag_agent_when_daemon_loaded(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """When both plists exist but only the system daemon is loaded, status
+        must not present the user agent as the primary failed service."""
+        self._force_macos(monkeypatch)
+
+        agent_plist = tmp_path / "ai.hermes.gateway.plist"
+        agent_plist.write_text("<plist/>", encoding="utf-8")
+        daemon_plist = tmp_path / "ai.hermes.daemon-nocturnum.plist"
+        daemon_plist.write_text("<plist/>", encoding="utf-8")
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda system=False: agent_plist)
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_daemon_plist_path", lambda: daemon_plist
+        )
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_daemon_label", lambda: "ai.hermes.daemon-nocturnum"
+        )
+        monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda system=False: True)
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["launchctl", "print"]:
+                return SimpleNamespace(returncode=0, stdout="loaded", stderr="")
+            if cmd[:2] == ["launchctl", "list"]:
+                return SimpleNamespace(returncode=113, stdout="", stderr="not loaded")
+            return SimpleNamespace(returncode=113, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        gateway_cli.launchd_status()
+
+        out = capsys.readouterr().out
+        # Healthy system daemon must still be reported.
+        assert "System LaunchDaemon" in out
+        assert "ai.hermes.daemon-nocturnum" in out
+        assert "is loaded" in out
+        # User LaunchAgent plist may be mentioned, but must not be flagged as
+        # the primary failed service when the system daemon owns the gateway.
+        assert "User LaunchAgent is not loaded" not in out
+        # Remediation hint must not nudge the user to start the user agent
+        # when the system daemon is already healthy.
+        assert "Run: hermes gateway start" not in out
+
+
+class TestLaunchdRunAsUserResolution:
+    """``_resolve_launchd_run_as_user`` must never silently emit UserName=root."""
+
+    def test_explicit_run_as_user_wins(self, monkeypatch):
+        # Even under sudo, an explicit value is honored verbatim.
+        monkeypatch.setenv("SUDO_USER", "alice")
+        monkeypatch.setattr(os, "getuid", lambda: 0)
+        monkeypatch.setattr(
+            pwd, "getpwnam",
+            lambda name: SimpleNamespace(pw_name=name, pw_dir=f"/home/{name}", pw_uid=1000, pw_gid=1000),
+        )
+        assert gateway_cli._resolve_launchd_run_as_user("bob") == "bob"
+
+    def test_explicit_run_as_user_strips_whitespace(self, monkeypatch):
+        monkeypatch.setenv("SUDO_USER", "alice")
+        monkeypatch.setattr(
+            pwd, "getpwnam",
+            lambda name: SimpleNamespace(pw_name=name, pw_dir=f"/home/{name}", pw_uid=1000, pw_gid=1000),
+        )
+        assert gateway_cli._resolve_launchd_run_as_user("  bob  ") == "bob"
+
+    def test_explicit_run_as_user_missing_account_raises(self, monkeypatch):
+        # --run-as-user must validate against the local password database
+        # before the resolver returns. Missing accounts must fail before any
+        # plist is written or launchctl is invoked.
+        def boom(name):
+            raise KeyError(name)
+
+        monkeypatch.setattr(pwd, "getpwnam", boom)
+        with pytest.raises(ValueError, match="unknown account"):
+            gateway_cli._resolve_launchd_run_as_user("nonexistent-xyzzy")
+
+    def test_explicit_root_is_allowed(self, monkeypatch):
+        # Operator opt-in to root is still allowed when stated explicitly.
+        monkeypatch.delenv("SUDO_USER", raising=False)
+        monkeypatch.setattr(os, "getuid", lambda: 0)
+        assert gateway_cli._resolve_launchd_run_as_user("root") == "root"
+
+    def test_falls_back_to_sudo_user_when_running_as_root(self, monkeypatch):
+        # `sudo hermes gateway install --system`: euid=0, SUDO_USER points at
+        # the invoking operator. The resolver picks SUDO_USER, NOT root.
+        real_user = pwd.getpwuid(os.getuid()).pw_name
+        if real_user == "root":
+            pytest.skip("test must run as a non-root user to exercise this path")
+        monkeypatch.setenv("SUDO_USER", real_user)
+        monkeypatch.setattr(os, "getuid", lambda: 0)
+        resolved = gateway_cli._resolve_launchd_run_as_user(None)
+        assert resolved == real_user
+        assert resolved != "root"
+
+    def test_ignores_sudo_user_equal_to_root(self, monkeypatch):
+        # SUDO_USER=root is meaningless (root sudo'd to root). Move on to the
+        # current-process-user fallback; if that's also root, raise.
+        monkeypatch.setenv("SUDO_USER", "root")
+        monkeypatch.setattr(os, "getuid", lambda: 0)
+        with pytest.raises(ValueError, match="--run-as-user"):
+            gateway_cli._resolve_launchd_run_as_user(None)
+
+    def test_ignores_unknown_sudo_user(self, monkeypatch):
+        # SUDO_USER references a deleted account → skip and try the next
+        # fallback. With euid 0 and no other non-root option, raise.
+        monkeypatch.setenv("SUDO_USER", "nonexistent-user-xyzzy")
+        monkeypatch.setattr(os, "getuid", lambda: 0)
+        with pytest.raises(ValueError, match="--run-as-user"):
+            gateway_cli._resolve_launchd_run_as_user(None)
+
+    def test_falls_back_to_current_user_when_non_root(self, monkeypatch):
+        monkeypatch.delenv("SUDO_USER", raising=False)
+        # Non-root invocation: just use whoami.
+        username = pwd.getpwuid(os.getuid()).pw_name
+        # Skip if test happens to run as root; the fallback would correctly
+        # raise instead.
+        if username == "root":
+            pytest.skip("test must run as a non-root user to exercise this path")
+        assert gateway_cli._resolve_launchd_run_as_user(None) == username
+
+    def test_root_with_no_non_root_candidate_raises(self, monkeypatch):
+        # euid 0, no SUDO_USER, current process *is* root → must refuse.
+        import pwd as _pwd
+
+        monkeypatch.delenv("SUDO_USER", raising=False)
+        monkeypatch.setattr(os, "getuid", lambda: 0)
+        # Force pwd.getpwuid(...).pw_name = "root" for any uid lookup the
+        # resolver performs.
+        monkeypatch.setattr(
+            _pwd,
+            "getpwuid",
+            lambda _uid: SimpleNamespace(pw_name="root", pw_dir="/root", pw_gid=0),
+        )
+        with pytest.raises(ValueError, match="--run-as-user"):
+            gateway_cli._resolve_launchd_run_as_user(None)
+
+    def test_generated_system_plist_uses_resolved_non_root_user(self, monkeypatch, tmp_path):
+        # The plist payload must reflect whatever the resolver picked.
+        real_user = pwd.getpwuid(os.getuid()).pw_name
+        if real_user == "root":
+            pytest.skip("test must run as a non-root user to exercise this path")
+        monkeypatch.setenv("SUDO_USER", real_user)
+        monkeypatch.setattr(os, "getuid", lambda: 0)
+        # Avoid touching the real ~/.hermes/logs directory under sudo.
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: tmp_path)
+        plist = gateway_cli.generate_launchd_plist(system=True)
+        assert "<key>UserName</key>" in plist
+        assert f"<string>{real_user}</string>" in plist
+        # No silent UserName=root payload should ever appear.
+        assert "<key>UserName</key>\n    <string>root</string>" not in plist
+
+
+class TestLaunchdSystemPlistTargetUserRemapping:
+    """Sudo-installed system LaunchDaemons must point at the *target* user's
+    home, not the calling (root) home, for HERMES_HOME / HOME / USER /
+    LOGNAME / VIRTUAL_ENV / paths / log files. Otherwise the daemon spawns
+    as ``alice`` but reads root's profile and never finds ``~alice/.hermes``.
+    """
+
+    def _patch_sudo_alice(self, monkeypatch, tmp_path, *, root_home="/var/root"):
+        """Simulate ``sudo hermes gateway install --system --run-as-user alice``
+        from a root login shell where:
+
+        * the calling process is root with HOME=/var/root
+        * SUDO_USER=alice
+        * pwd.getpwnam("alice") resolves to a tmp-backed home directory
+        * ``get_hermes_home()`` resolves under root's home (the bug being fixed)
+        """
+        alice_home = tmp_path / "Users" / "alice"
+        alice_home.mkdir(parents=True)
+        # Calling-user state (root under sudo).
+        monkeypatch.setenv("SUDO_USER", "alice")
+        monkeypatch.setenv("HOME", root_home)
+        monkeypatch.setenv("HERMES_HOME", f"{root_home}/.hermes")
+        monkeypatch.setattr(os, "getuid", lambda: 0)
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: Path(root_home)))
+        # Force get_hermes_home() to resolve under root, mirroring real sudo.
+        monkeypatch.setattr(
+            gateway_cli, "get_hermes_home", lambda: Path(f"{root_home}/.hermes")
+        )
+
+        # pwd records: alice exists, root exists, missing accounts blow up.
+        real_pwd = {
+            "alice": SimpleNamespace(
+                pw_name="alice", pw_dir=str(alice_home), pw_uid=1001, pw_gid=1001
+            ),
+            "root": SimpleNamespace(
+                pw_name="root", pw_dir=root_home, pw_uid=0, pw_gid=0
+            ),
+        }
+
+        def fake_getpwnam(name):
+            try:
+                return real_pwd[name]
+            except KeyError as e:
+                raise KeyError(name) from e
+
+        monkeypatch.setattr(pwd, "getpwnam", fake_getpwnam)
+        return alice_home
+
+    def _capture_chowns(self, monkeypatch):
+        """Hook both ``os.chown`` (path-based — must NOT fire for the
+        target-user Hermes/log dirs, otherwise the TOCTOU window between
+        verification and chown reopens) and ``os.fchown`` (handle-based —
+        records ``(inode, uid, gid)`` so callers can map fds back to
+        expected directories via ``os.stat(path).st_ino``).
+
+        Returns ``(chown_calls, fchown_records)``.
+        """
+        chown_calls: list[tuple[str, int, int]] = []
+        fchown_records: list[tuple[int, int, int]] = []
+
+        def fake_chown(path, uid, gid):
+            chown_calls.append((str(path), uid, gid))
+
+        def fake_fchown(fd, uid, gid):
+            # Resolve the fd to its inode while it is still open — the
+            # helper closes fds immediately after fchown returns.
+            fchown_records.append((os.fstat(fd).st_ino, uid, gid))
+
+        monkeypatch.setattr(gateway_cli.os, "chown", fake_chown)
+        monkeypatch.setattr(gateway_cli.os, "fchown", fake_fchown)
+        return chown_calls, fchown_records
+
+    def test_system_plist_remaps_home_user_logname_and_hermes_home_to_target(
+        self, monkeypatch, tmp_path
+    ):
+        alice_home = self._patch_sudo_alice(monkeypatch, tmp_path)
+
+        plist = gateway_cli.generate_launchd_plist(system=True, run_as_user="alice")
+
+        assert "<key>UserName</key>" in plist
+        assert "<string>alice</string>" in plist
+        # Target-user environment must be set so HOME-aware code under the
+        # daemon (config loaders, ssh keys, etc.) doesn't read /var/root.
+        assert "<key>HOME</key>" in plist
+        assert f"<string>{alice_home}</string>" in plist
+        assert "<key>USER</key>" in plist
+        assert "<key>LOGNAME</key>" in plist
+        # HERMES_HOME must follow alice, not root.
+        assert f"<string>{alice_home}/.hermes</string>" in plist
+        # And no /var/root leakage anywhere in the plist payload.
+        assert "/var/root" not in plist
+
+    def test_system_plist_logs_under_target_hermes_home_not_root(
+        self, monkeypatch, tmp_path
+    ):
+        alice_home = self._patch_sudo_alice(monkeypatch, tmp_path)
+
+        plist = gateway_cli.generate_launchd_plist(system=True, run_as_user="alice")
+
+        expected_log_dir = alice_home / ".hermes" / "logs"
+        assert f"<string>{expected_log_dir}/gateway.log</string>" in plist
+        assert f"<string>{expected_log_dir}/gateway.error.log</string>" in plist
+        # Negative: the bug emitted /var/root/.hermes/logs.
+        assert "/var/root/.hermes/logs" not in plist
+        # Side-effect: the target log directory should now exist (best
+        # effort) so launchd can open StandardOutPath on first run.
+        assert expected_log_dir.exists()
+
+    def test_system_plist_chowns_full_target_hermes_chain_not_just_logs(
+        self, monkeypatch, tmp_path
+    ):
+        """When sudo/root generates a system LaunchDaemon plist, chowning
+        only the leaf ``logs/`` dir leaves the ``HERMES_HOME`` (and any
+        ``.hermes/profiles/<name>/`` parent we just mkdir-as-root) owned
+        by root. The daemon then launches as ``alice`` and cannot write
+        ``gateway.pid`` into its own HERMES_HOME. Ownership must be
+        applied to the full target chain we created, not just the logs
+        leaf — but never beyond the target user's home tree.
+        """
+        alice_home = self._patch_sudo_alice(monkeypatch, tmp_path)
+        # Use a profile-mapped HERMES_HOME so we exercise the intermediate
+        # ``.hermes/profiles/coder/`` directory that mkdir(parents=True)
+        # creates as root.
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_hermes_home",
+            lambda: Path("/var/root/.hermes/profiles/coder"),
+        )
+        monkeypatch.setattr(gateway_cli.os, "geteuid", lambda: 0)
+
+        chown_calls, fchown_records = self._capture_chowns(monkeypatch)
+
+        gateway_cli.generate_launchd_plist(system=True, run_as_user="alice")
+
+        expected_hermes_home = alice_home / ".hermes" / "profiles" / "coder"
+        expected_log_dir = expected_hermes_home / "logs"
+        expected_profiles_dir = alice_home / ".hermes" / "profiles"
+        expected_dot_hermes = alice_home / ".hermes"
+
+        # Path-based ``os.chown`` is TOCTOU-vulnerable for target-user
+        # paths and must not be used here — ownership flows through
+        # ``os.fchown`` on a handle opened with ``O_NOFOLLOW``.
+        assert chown_calls == []
+
+        chowned_inodes = {ino for ino, _u, _g in fchown_records}
+        # Daemon writes gateway.pid here — must be alice-owned.
+        assert os.stat(expected_hermes_home).st_ino in chowned_inodes
+        # StandardOutPath/StandardErrorPath open here.
+        assert os.stat(expected_log_dir).st_ino in chowned_inodes
+        # Intermediates created by mkdir as root must also flip ownership
+        # so alice can traverse them.
+        assert os.stat(expected_profiles_dir).st_ino in chowned_inodes
+        assert os.stat(expected_dot_hermes).st_ino in chowned_inodes
+
+        # Every fchown must target alice's uid/gid, never root's.
+        for _ino, uid, gid in fchown_records:
+            assert (uid, gid) == (1001, 1001)
+
+        # Safety: never chown the user's home itself or anything outside
+        # the target ``.hermes`` tree. Each verified inode must match a
+        # directory under the target ``.hermes`` chain.
+        allowed_inodes = {
+            os.stat(p).st_ino
+            for p in (
+                expected_dot_hermes,
+                expected_profiles_dir,
+                expected_hermes_home,
+                expected_log_dir,
+            )
+        }
+        assert os.stat(alice_home).st_ino not in chowned_inodes
+        for ino in chowned_inodes:
+            assert ino in allowed_inodes, (
+                f"fchown targeted an inode outside the target .hermes tree: {ino}"
+            )
+
+    def test_system_plist_skips_chown_for_custom_hermes_home_outside_user_tree(
+        self, monkeypatch, tmp_path
+    ):
+        """Custom HERMES_HOME paths that don't live under the target
+        user's home (e.g. /opt/hermes) must NOT trigger a chown walk
+        across arbitrary parents. We only chown the explicit hermes_home
+        + logs leaf and stop there.
+        """
+        self._patch_sudo_alice(monkeypatch, tmp_path)
+        custom_home = tmp_path / "opt" / "custom-hermes"
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: custom_home)
+        monkeypatch.setattr(gateway_cli.os, "geteuid", lambda: 0)
+
+        chown_calls, fchown_records = self._capture_chowns(monkeypatch)
+
+        gateway_cli.generate_launchd_plist(system=True, run_as_user="alice")
+
+        # No path-based chown for the target-user dirs.
+        assert chown_calls == []
+
+        chowned_inodes = {ino for ino, _u, _g in fchown_records}
+        # Only the explicit hermes_home + its logs leaf — no ancestor walk.
+        assert chowned_inodes == {
+            os.stat(custom_home).st_ino,
+            os.stat(custom_home / "logs").st_ino,
+        }
+
+    def test_system_plist_skips_chown_when_not_root(
+        self, monkeypatch, tmp_path
+    ):
+        """Non-root callers (e.g. running tests, plist regeneration via
+        ``launchd_plist_is_current``) must never invoke os.chown — that
+        would either fail with EPERM or, worse on misconfigured systems,
+        flip ownership unexpectedly.
+        """
+        self._patch_sudo_alice(monkeypatch, tmp_path)
+        monkeypatch.setattr(gateway_cli.os, "geteuid", lambda: 501)
+
+        chown_calls, fchown_records = self._capture_chowns(monkeypatch)
+
+        gateway_cli.generate_launchd_plist(system=True, run_as_user="alice")
+
+        assert chown_calls == []
+        assert fchown_records == []
+
+    def test_system_plist_refuses_to_chown_when_dot_hermes_is_a_symlink(
+        self, monkeypatch, tmp_path
+    ):
+        """Security: a pre-existing or attacker-planted symlink at any
+        component of the target user's Hermes chain (e.g.
+        ``~alice/.hermes -> /etc``) must NOT trigger any ``os.chown`` —
+        otherwise root would flip ownership of the symlink target (here
+        an arbitrary attacker-controlled directory).
+        """
+        alice_home = self._patch_sudo_alice(monkeypatch, tmp_path)
+        monkeypatch.setattr(gateway_cli.os, "geteuid", lambda: 0)
+
+        attacker_target = tmp_path / "attacker_target"
+        attacker_target.mkdir()
+        (alice_home / ".hermes").symlink_to(attacker_target)
+
+        chown_calls, fchown_records = self._capture_chowns(monkeypatch)
+
+        gateway_cli.generate_launchd_plist(system=True, run_as_user="alice")
+
+        # Hostile component → entire walk aborts; nothing is chowned via
+        # either the path-based or handle-based code path.
+        assert chown_calls == []
+        assert fchown_records == []
+        # Defence in depth: the symlink target must remain untouched —
+        # neither directly nor via the symlink path.
+        assert not (attacker_target / "logs").exists(), (
+            "log_dir was created inside the symlink target — symlink was followed"
+        )
+
+    def test_system_plist_refuses_to_chown_when_log_dir_is_a_symlink(
+        self, monkeypatch, tmp_path
+    ):
+        """Security: a symlink at the log-leaf component (e.g.
+        ``~alice/.hermes/logs -> /var/log/system_dir``) must also abort
+        the chown walk — the entire chain is rejected when any element
+        fails the lstat check, so neither the symlink nor any earlier
+        verified component gets chowned.
+        """
+        alice_home = self._patch_sudo_alice(monkeypatch, tmp_path)
+        monkeypatch.setattr(gateway_cli.os, "geteuid", lambda: 0)
+
+        # ``.hermes`` is a real directory but ``logs`` is a symlink that
+        # points outside the user's tree.
+        (alice_home / ".hermes").mkdir()
+        attacker_target = tmp_path / "stolen_logs"
+        attacker_target.mkdir()
+        (alice_home / ".hermes" / "logs").symlink_to(attacker_target)
+
+        chown_calls, fchown_records = self._capture_chowns(monkeypatch)
+
+        gateway_cli.generate_launchd_plist(system=True, run_as_user="alice")
+
+        # No path-based chown is performed for any target-user dir.
+        assert chown_calls == []
+        # The symlink target's inode must NEVER appear in fchown records
+        # (that would mean ``open(O_NOFOLLOW)`` traversed the symlink).
+        chowned_inodes = {ino for ino, _u, _g in fchown_records}
+        assert os.stat(attacker_target).st_ino not in chowned_inodes
+
+    def test_system_plist_refuses_to_chown_when_intermediate_profile_dir_is_a_symlink(
+        self, monkeypatch, tmp_path
+    ):
+        """Security: when HERMES_HOME maps to ``~alice/.hermes/profiles/coder``
+        but ``~alice/.hermes/profiles`` is already a symlink, the walk must
+        reject that intermediate component before mkdir traverses through it
+        — otherwise root would create ``coder/`` and ``coder/logs/`` under
+        the symlink target and chown them.
+        """
+        alice_home = self._patch_sudo_alice(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_hermes_home",
+            lambda: Path("/var/root/.hermes/profiles/coder"),
+        )
+        monkeypatch.setattr(gateway_cli.os, "geteuid", lambda: 0)
+
+        attacker_target = tmp_path / "stolen_profiles"
+        attacker_target.mkdir()
+        (alice_home / ".hermes").mkdir()
+        (alice_home / ".hermes" / "profiles").symlink_to(attacker_target)
+
+        chown_calls, fchown_records = self._capture_chowns(monkeypatch)
+
+        gateway_cli.generate_launchd_plist(system=True, run_as_user="alice")
+
+        # Walk aborted at the symlinked intermediate; no chown happens
+        # via either code path, and the symlink target must NOT have
+        # ``coder/`` written into it.
+        assert chown_calls == []
+        assert fchown_records == []
+        assert not (attacker_target / "coder").exists(), (
+            "intermediate symlink was followed and traversed by mkdir"
+        )
+
+    def test_system_plist_uses_handle_based_fchown_not_path_chown_for_target_dirs(
+        self, monkeypatch, tmp_path
+    ):
+        """TOCTOU defence: ownership for the target-user Hermes/log
+        chain MUST flow through ``os.fchown`` on a handle opened with
+        ``O_RDONLY|O_DIRECTORY|O_NOFOLLOW``, never through path-based
+        ``os.chown``. With path-based chown the target user could swap
+        a verified component for a symlink between the lstat check and
+        the chown syscall, redirecting ownership to an attacker-chosen
+        path. Asserting both that ``os.chown`` was not called for these
+        dirs and that ``os.fchown`` was invoked on fds whose inodes
+        match the verified directories pins this contract.
+        """
+        alice_home = self._patch_sudo_alice(monkeypatch, tmp_path)
+        monkeypatch.setattr(gateway_cli.os, "geteuid", lambda: 0)
+
+        chown_calls, fchown_records = self._capture_chowns(monkeypatch)
+
+        # Capture the (path, fd) pairs the helper actually opens so the
+        # test can prove the fchown'd fd really refers to the directory
+        # we expected, not e.g. a parent that happens to share an inode
+        # collision in some other corner of the filesystem. The helper
+        # walks child components using ``dir_fd`` so the recorded ``path``
+        # for non-anchor opens is a *relative* name; we reconstruct the
+        # absolute path by joining onto the dir_fd's recorded path.
+        real_open = os.open
+        opened_fds: dict[int, str] = {}
+
+        def tracking_open(path, flags, mode=0o777, *args, **kwargs):
+            dir_fd = kwargs.get("dir_fd")
+            fd = real_open(path, flags, mode, *args, **kwargs)
+            if flags & os.O_DIRECTORY and flags & os.O_NOFOLLOW:
+                if dir_fd is not None and dir_fd in opened_fds:
+                    opened_fds[fd] = os.path.join(opened_fds[dir_fd], str(path))
+                else:
+                    opened_fds[fd] = str(path)
+            return fd
+
+        monkeypatch.setattr(gateway_cli.os, "open", tracking_open)
+
+        gateway_cli.generate_launchd_plist(system=True, run_as_user="alice")
+
+        # Hard requirement: path-based chown must not touch the
+        # target-user dirs — that is the TOCTOU vector being closed.
+        assert chown_calls == [], (
+            "os.chown was called for target-user dirs — this re-opens "
+            "the lstat→chown TOCTOU window."
+        )
+        # And fchown must have done the actual ownership transfer for
+        # both the HERMES_HOME and the log leaf, with the target user's
+        # uid/gid.
+        assert fchown_records, "os.fchown was never invoked for target dirs"
+        for _ino, uid, gid in fchown_records:
+            assert (uid, gid) == (1001, 1001)
+
+        expected_dot_hermes = alice_home / ".hermes"
+        expected_log_dir = expected_dot_hermes / "logs"
+        chowned_inodes = {ino for ino, _u, _g in fchown_records}
+        assert os.stat(expected_dot_hermes).st_ino in chowned_inodes
+        assert os.stat(expected_log_dir).st_ino in chowned_inodes
+
+        # And the helper opened those exact paths with O_NOFOLLOW (i.e.
+        # rejected symlink traversal at the kernel level rather than
+        # relying on a TOCTOU-prone lstat).
+        opened_paths = set(opened_fds.values())
+        assert str(expected_dot_hermes) in opened_paths
+        assert str(expected_log_dir) in opened_paths
+
+    def test_system_plist_descend_is_dir_fd_anchored_against_parent_swap(
+        self, monkeypatch, tmp_path
+    ):
+        """TOCTOU defence (parent swap mid-walk): ``O_NOFOLLOW`` on an
+        absolute-path open only protects the *final* component, so an
+        iterative chain that re-opens each component by absolute path is
+        racy — between iterations the target user can rename a verified
+        parent (e.g. ``~alice/.hermes``) and replace it with a symlink,
+        and the next absolute-path ``mkdir`` / ``open`` would create /
+        chown the child *under the swapped target*. The helper must walk
+        from a held ``target_home`` fd downward using
+        ``dir_fd=parent_fd`` for every child mkdir/open so the kernel
+        resolves child names against the inode we already pinned, not
+        against the swapped absolute path.
+
+        We simulate the swap by hooking ``os.open``: as soon as the
+        helper opens ``~alice/.hermes`` (the verified parent), we
+        rename that real directory aside and replace
+        ``~alice/.hermes`` on the path with a symlink pointing at an
+        attacker-controlled directory. With dir_fd-anchored descent the
+        next ``mkdir("logs", dir_fd=fd_of_original_dot_hermes)`` lands
+        inside the *original* (renamed-aside) directory, and nothing
+        is created or chowned under the attacker target.
+        """
+        alice_home = self._patch_sudo_alice(monkeypatch, tmp_path)
+        monkeypatch.setattr(gateway_cli.os, "geteuid", lambda: 0)
+
+        # Pre-create ``~alice/.hermes`` so the first iteration verifies a
+        # real directory and the swap fires after its fd is held.
+        real_dot_hermes = alice_home / ".hermes"
+        real_dot_hermes.mkdir()
+        attacker_target = tmp_path / "attacker_dir"
+        attacker_target.mkdir()
+        moved_aside = alice_home / ".hermes_real_inode"
+
+        chown_calls, fchown_records = self._capture_chowns(monkeypatch)
+
+        # Track absolute mkdir paths (any mkdir without dir_fd that
+        # touches the swapped path is a violation).
+        real_mkdir = os.mkdir
+        absolute_mkdir_calls: list[str] = []
+
+        def tracking_mkdir(path, mode=0o777, *args, **kwargs):
+            if kwargs.get("dir_fd") is None:
+                absolute_mkdir_calls.append(str(path))
+            return real_mkdir(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(gateway_cli.os, "mkdir", tracking_mkdir)
+
+        real_open = os.open
+        swap_fired = {"done": False}
+
+        def swapping_open(path, flags, mode=0o777, *args, **kwargs):
+            fd = real_open(path, flags, mode, *args, **kwargs)
+            if (
+                not swap_fired["done"]
+                and flags & os.O_DIRECTORY
+                and flags & os.O_NOFOLLOW
+                and kwargs.get("dir_fd") is not None
+                and str(path) == ".hermes"
+            ):
+                # The helper has just verified and pinned the real
+                # ``~alice/.hermes`` inode. Now race a parent swap: move
+                # the real dir aside and put a symlink to an attacker
+                # target in its place. Any later absolute-path
+                # ``mkdir(~alice/.hermes/logs)`` would land in the
+                # attacker dir; a dir_fd-anchored descent uses the held
+                # fd and is unaffected.
+                real_dot_hermes.rename(moved_aside)
+                os.symlink(attacker_target, real_dot_hermes)
+                swap_fired["done"] = True
+            return fd
+
+        monkeypatch.setattr(gateway_cli.os, "open", swapping_open)
+
+        gateway_cli.generate_launchd_plist(system=True, run_as_user="alice")
+
+        # The swap must actually have fired — otherwise the test isn't
+        # exercising the parent-swap path.
+        assert swap_fired["done"], (
+            "test setup did not trigger the simulated parent swap"
+        )
+
+        # Hard requirement #1: no path-based ``os.chown`` for target dirs.
+        assert chown_calls == [], (
+            "path-based os.chown was called for target-user dirs — that "
+            "re-opens the lstat→chown TOCTOU window."
+        )
+
+        # Hard requirement #2: no absolute-path ``os.mkdir`` ever
+        # targeted a child of target_home/.hermes. The dir_fd descent
+        # must use relative names anchored on the held parent fd, so
+        # any absolute mkdir under the (now-swapped) ``~alice/.hermes``
+        # path is exactly the bug.
+        forbidden_prefix = str(alice_home / ".hermes") + os.sep
+        for p in absolute_mkdir_calls:
+            assert not p.startswith(forbidden_prefix), (
+                f"absolute-path mkdir under swapped parent: {p!r} — "
+                "child mkdirs must use dir_fd against the verified "
+                "parent fd, not the swapped absolute path."
+            )
+
+        # Hard requirement #3: nothing was created inside the attacker
+        # directory. If the helper had used absolute-path
+        # mkdir/open after the swap, ``logs/`` would have appeared
+        # under attacker_target via the symlink.
+        assert not (attacker_target / "logs").exists(), (
+            "log dir was created inside the attacker symlink target — "
+            "child create followed the swapped parent path."
+        )
+        assert list(attacker_target.iterdir()) == [], (
+            f"attacker target was written to: {list(attacker_target.iterdir())}"
+        )
+
+        # And the actual log dir should live inside the *original*
+        # (renamed-aside) ``.hermes`` inode — that's where the held fd
+        # pointed when we created ``logs``.
+        assert (moved_aside / "logs").is_dir(), (
+            "log dir was not created under the held parent fd's inode"
+        )
+
+        # fchown must have flipped ownership on alice's uid/gid and
+        # only on inodes inside the original .hermes tree.
+        chowned_inodes = {ino for ino, _u, _g in fchown_records}
+        for _ino, uid, gid in fchown_records:
+            assert (uid, gid) == (1001, 1001)
+        attacker_inode = os.stat(attacker_target).st_ino
+        assert attacker_inode not in chowned_inodes, (
+            "fchown landed on attacker-controlled inode"
+        )
+        # The original .hermes and its logs leaf should be the chowned set.
+        assert os.stat(moved_aside).st_ino in chowned_inodes
+        assert os.stat(moved_aside / "logs").st_ino in chowned_inodes
+
+    def test_system_plist_remaps_paths_living_under_calling_user_home(
+        self, monkeypatch, tmp_path
+    ):
+        alice_home = self._patch_sudo_alice(monkeypatch, tmp_path)
+        # Pretend the venv was detected under root's home — that's exactly
+        # the wrong path to bake into a daemon that runs as alice.
+        root_venv = Path("/var/root/hermes-agent/venv")
+        monkeypatch.setattr(gateway_cli, "_detect_venv_dir", lambda: root_venv)
+        monkeypatch.setattr(
+            gateway_cli, "get_python_path", lambda: str(root_venv / "bin" / "python"),
+        )
+        # Likewise PROJECT_ROOT could live under root's home.
+        monkeypatch.setattr(
+            gateway_cli, "PROJECT_ROOT", Path("/var/root/hermes-agent"),
+        )
+        # Caller's PATH includes a /var/root/.local/bin entry that must be
+        # rewritten so the daemon can execute it.
+        monkeypatch.setenv(
+            "PATH", "/var/root/.local/bin:/usr/local/bin:/usr/bin:/bin",
+        )
+
+        plist = gateway_cli.generate_launchd_plist(system=True, run_as_user="alice")
+
+        # VIRTUAL_ENV / venv bin / python all under alice now.
+        assert f"<string>{alice_home}/hermes-agent/venv</string>" in plist
+        assert f"{alice_home}/hermes-agent/venv/bin/python" in plist
+        # PATH no longer references /var/root.
+        assert "/var/root" not in plist
+        # Common system bin that did NOT live under root's home is preserved.
+        assert "/usr/local/bin" in plist
+
+    def test_system_plist_remaps_resolved_node_dir_under_calling_user_home(
+        self, monkeypatch, tmp_path
+    ):
+        alice_home = self._patch_sudo_alice(monkeypatch, tmp_path)
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        monkeypatch.setattr(
+            gateway_cli.shutil,
+            "which",
+            lambda name: "/var/root/.nvm/versions/node/v22.0.0/bin/node" if name == "node" else None,
+        )
+
+        plist = gateway_cli.generate_launchd_plist(system=True, run_as_user="alice")
+
+        assert "/var/root" not in plist
+        assert f"{alice_home}/.nvm/versions/node/v22.0.0/bin" in plist
+
+    def test_install_with_missing_run_as_user_fails_before_write_or_launchctl(
+        self, monkeypatch, tmp_path
+    ):
+        # Validation must happen before the plist is written and before any
+        # launchctl bootstrap is attempted, so partially-applied installs
+        # don't leave dangling state.
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_plist_path", lambda system=False: plist_path,
+        )
+        monkeypatch.setattr(os, "geteuid", lambda: 0)  # pass _require_root preflight
+
+        # Only "alice" exists in our fake pwd db; "ghost" must raise.
+        real_pwd = {
+            "alice": SimpleNamespace(
+                pw_name="alice", pw_dir=str(tmp_path / "alice"), pw_uid=1001, pw_gid=1001
+            ),
+        }
+
+        def fake_getpwnam(name):
+            try:
+                return real_pwd[name]
+            except KeyError as e:
+                raise KeyError(name) from e
+
+        monkeypatch.setattr(pwd, "getpwnam", fake_getpwnam)
+
+        launchctl_calls: list[list] = []
+
+        def fake_run(cmd, *args, **kwargs):
+            launchctl_calls.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        with pytest.raises(ValueError, match="unknown account"):
+            gateway_cli.launchd_install(system=True, run_as_user="ghost")
+
+        # Neither plist nor launchctl bootstrap should have happened.
+        assert not plist_path.exists()
+        assert launchctl_calls == []
+
+
+class TestLaunchdSystemRoutingAndPreflight:
+    """Default routing + non-root preflight for macOS system LaunchDaemon."""
+
+    def _force_macos(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_linux", lambda: False)
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_container", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_wsl", lambda: False)
+
+    def test_select_launchd_scope_promotes_to_system_when_only_daemon_installed(
+        self, tmp_path, monkeypatch
+    ):
+        self._force_macos(monkeypatch)
+        agent_plist = tmp_path / "agent.plist"  # missing
+        daemon_plist = tmp_path / "daemon.plist"
+        daemon_plist.write_text("<plist/>", encoding="utf-8")
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_launchd_plist_path",
+            lambda system=False: daemon_plist if system else agent_plist,
+        )
+        assert gateway_cli._select_launchd_scope(system=False) is True
+
+    def test_select_launchd_scope_keeps_user_for_mixed_install(
+        self, tmp_path, monkeypatch
+    ):
+        # Mixed install: don't promote silently. Operators can pass --system
+        # explicitly to override.
+        self._force_macos(monkeypatch)
+        agent_plist = tmp_path / "agent.plist"
+        agent_plist.write_text("<plist/>", encoding="utf-8")
+        daemon_plist = tmp_path / "daemon.plist"
+        daemon_plist.write_text("<plist/>", encoding="utf-8")
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_launchd_plist_path",
+            lambda system=False: daemon_plist if system else agent_plist,
+        )
+        assert gateway_cli._select_launchd_scope(system=False) is False
+
+    def test_select_launchd_scope_explicit_system_wins(self, tmp_path, monkeypatch):
+        self._force_macos(monkeypatch)
+        agent_plist = tmp_path / "agent.plist"
+        agent_plist.write_text("<plist/>", encoding="utf-8")
+        daemon_plist = tmp_path / "daemon.plist"  # missing
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_launchd_plist_path",
+            lambda system=False: daemon_plist if system else agent_plist,
+        )
+        assert gateway_cli._select_launchd_scope(system=True) is True
+
+    def test_launchd_start_routes_to_system_when_only_daemon_installed(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        # Plain `hermes gateway start` should target the system daemon when
+        # that is the only installed scope, instead of bootstrapping a brand
+        # new user LaunchAgent.
+        self._force_macos(monkeypatch)
+        agent_plist = tmp_path / "agent.plist"  # missing
+        daemon_plist = tmp_path / "daemon.plist"
+        daemon_plist.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_launchd_plist_path",
+            lambda system=False: daemon_plist if system else agent_plist,
+        )
+        # Pretend we're root so the preflight passes.
+        monkeypatch.setattr(os, "geteuid", lambda: 0)
+
+        calls = []
+
+        def fake_run(cmd, check=False, **kwargs):
+            calls.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        gateway_cli.launchd_start(system=False)
+
+        # System scope was selected → kickstart targets system/<daemon-label>.
+        daemon_label = gateway_cli.get_launchd_daemon_label()
+        assert any(
+            cmd == ["launchctl", "kickstart", f"system/{daemon_label}"]
+            for cmd in calls
+        )
+        # And NOT the user agent label.
+        agent_label = gateway_cli.get_launchd_label(system=False)
+        assert not any(
+            agent_label in part for cmd in calls for part in cmd if isinstance(part, str)
+        )
+
+    def test_launchd_start_non_root_preflight_blocks_system_scope(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        self._force_macos(monkeypatch)
+        agent_plist = tmp_path / "agent.plist"  # missing
+        daemon_plist = tmp_path / "daemon.plist"
+        daemon_plist.write_text("<plist/>", encoding="utf-8")
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_launchd_plist_path",
+            lambda system=False: daemon_plist if system else agent_plist,
+        )
+        monkeypatch.setattr(os, "geteuid", lambda: 1000)
+
+        calls = []
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *a, **kw: calls.append(("subprocess.run", a, kw)) or SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            gateway_cli.launchd_start(system=False)
+
+        assert exc_info.value.code == 1
+        # No mutating launchctl call should have been issued before the bail.
+        assert calls == []
+        out = capsys.readouterr().out
+        assert "requires root" in out
+        assert "sudo hermes gateway start" in out
+
+    @pytest.mark.parametrize(
+        "action,fn",
+        [
+            ("install", lambda: gateway_cli.launchd_install(system=True)),
+            ("uninstall", lambda: gateway_cli.launchd_uninstall(system=True)),
+            ("start", lambda: gateway_cli.launchd_start(system=True)),
+            ("stop", lambda: gateway_cli.launchd_stop(system=True)),
+            ("restart", lambda: gateway_cli.launchd_restart(system=True)),
+        ],
+    )
+    def test_explicit_system_action_requires_root(
+        self, action, fn, tmp_path, monkeypatch, capsys
+    ):
+        self._force_macos(monkeypatch)
+        # Make both plists discoverable so _select_launchd_scope is a no-op.
+        plist = tmp_path / f"{action}.plist"
+        plist.write_text("<plist/>", encoding="utf-8")
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_plist_path", lambda system=False: plist
+        )
+        monkeypatch.setattr(os, "geteuid", lambda: 1000)
+        # Subprocess must NEVER be invoked — the preflight has to bail first.
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *a, **kw: (_ for _ in ()).throw(
+                AssertionError("launchctl must not run as non-root for system scope")
+            ),
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            fn()
+
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert "requires root" in out
+        assert f"sudo hermes gateway {action}" in out
+
+    def test_get_service_pids_includes_system_launchdaemon_pid(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+
+        agent_label = gateway_cli.get_launchd_label()
+        daemon_label = gateway_cli.get_launchd_daemon_label()
+        monkeypatch.setattr(
+            gateway_cli, "_installed_launchd_user_agent_labels", lambda: {agent_label}
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_installed_launchd_system_daemon_labels", lambda: {daemon_label}
+        )
+
+        def fake_run(cmd, capture_output=True, text=True, timeout=5, **kwargs):
+            if cmd == ["launchctl", "list", agent_label]:
+                # No user-agent — empty list output.
+                return SimpleNamespace(returncode=113, stdout="", stderr="")
+            if cmd == ["launchctl", "print", f"system/{daemon_label}"]:
+                # Real `launchctl print` output is verbose; the parser only
+                # needs the `pid = N` line.
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=(
+                        f"system/{daemon_label} = {{\n"
+                        "    active count = 1\n"
+                        "    pid = 4321\n"
+                        "    state = running\n"
+                        "}\n"
+                    ),
+                    stderr="",
+                )
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        pids = gateway_cli._get_service_pids()
+        assert 4321 in pids
+
+    def test_get_service_pids_includes_other_profile_launchdaemon_pid(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+
+        launch_agents = tmp_path / "LaunchAgents"
+        launch_daemons = tmp_path / "LaunchDaemons"
+        launch_agents.mkdir()
+        launch_daemons.mkdir()
+        (launch_agents / "ai.hermes.gateway-coder.plist").write_text(
+            "<plist/>\n", encoding="utf-8"
+        )
+        (launch_daemons / "ai.hermes.daemon-coder.plist").write_text(
+            "<plist/>\n", encoding="utf-8"
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_launchd_plist_path",
+            lambda system=False: (
+                launch_daemons / "ai.hermes.daemon.plist"
+                if system
+                else launch_agents / "ai.hermes.gateway.plist"
+            ),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_launchd_label",
+            lambda system=False: "ai.hermes.daemon" if system else "ai.hermes.gateway",
+        )
+
+        def fake_run(cmd, capture_output=True, text=True, timeout=5, **kwargs):
+            if cmd == ["launchctl", "list", "ai.hermes.gateway"]:
+                return SimpleNamespace(returncode=113, stdout="", stderr="")
+            if cmd == ["launchctl", "list", "ai.hermes.gateway-coder"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout='{\n  "PID" = 7654;\n}\n',
+                    stderr="",
+                )
+            if cmd == ["launchctl", "print", "system/ai.hermes.daemon"]:
+                return SimpleNamespace(returncode=113, stdout="", stderr="")
+            if cmd == ["launchctl", "print", "system/ai.hermes.daemon-coder"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="system/ai.hermes.daemon-coder = {\n  pid = 8765\n}\n",
+                    stderr="",
+                )
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        pids = gateway_cli._get_service_pids()
+
+        assert 7654 in pids
+        assert 8765 in pids
+
+    def test_launchd_install_system_skips_subprocess_when_non_root(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        # The install preflight runs BEFORE we touch /Library/LaunchDaemons,
+        # so no plist must be written and no subprocess invoked.
+        self._force_macos(monkeypatch)
+        plist = tmp_path / "ai.hermes.daemon.plist"
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_plist_path", lambda system=False: plist
+        )
+        monkeypatch.setattr(os, "geteuid", lambda: 501)
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *a, **kw: (_ for _ in ()).throw(
+                AssertionError("subprocess must not run as non-root for system install")
+            ),
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            gateway_cli.launchd_install(system=True, run_as_user="alice")
+
+        assert exc_info.value.code == 1
+        assert not plist.exists()
+        out = capsys.readouterr().out
+        assert "requires root" in out
+
+
+class TestLaunchdSystemPlistPermissions:
+    """``/Library/LaunchDaemons/*.plist`` must be ``root:wheel`` and ``0644``
+    before ``launchctl bootstrap`` — otherwise launchd silently refuses to
+    load the job. Cover fresh install, stale-refresh and start self-heal.
+    """
+
+    def _install_grp_stub(self, monkeypatch, *, wheel_gid=0):
+        import grp as real_grp
+
+        original_getgrnam = real_grp.getgrnam
+
+        def fake_getgrnam(name):
+            if name == "wheel":
+                return SimpleNamespace(gr_name="wheel", gr_gid=wheel_gid, gr_mem=[])
+            return original_getgrnam(name)
+
+        monkeypatch.setattr(real_grp, "getgrnam", fake_getgrnam)
+
+    def _capture_perm_calls(self, monkeypatch):
+        chmod_calls: list[tuple[str, int]] = []
+        chown_calls: list[tuple[str, int, int]] = []
+
+        original_chmod = os.chmod
+        original_chown = os.chown
+
+        def fake_chmod(path, mode, *args, **kwargs):
+            chmod_calls.append((str(path), mode))
+            return original_chmod(path, mode, *args, **kwargs)
+
+        def fake_chown(path, uid, gid, *args, **kwargs):
+            chown_calls.append((str(path), uid, gid))
+            # Don't actually chown — we'd need root and we don't want to flip
+            # ownership of test fixtures.
+
+        monkeypatch.setattr(gateway_cli.os, "chmod", fake_chmod)
+        monkeypatch.setattr(gateway_cli.os, "chown", fake_chown)
+        return chmod_calls, chown_calls
+
+    def test_fresh_install_sets_root_wheel_and_0644_before_bootstrap(
+        self, tmp_path, monkeypatch
+    ):
+        plist_path = tmp_path / "ai.hermes.daemon.plist"
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_plist_path", lambda system=False: plist_path
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "generate_launchd_plist",
+            lambda system=False, run_as_user=None: "<plist/>\n",
+        )
+        monkeypatch.setattr(os, "geteuid", lambda: 0)
+        monkeypatch.setattr(gateway_cli.os, "geteuid", lambda: 0)
+
+        self._install_grp_stub(monkeypatch, wheel_gid=0)
+        chmod_calls, chown_calls = self._capture_perm_calls(monkeypatch)
+
+        bootstrap_seen_perms: dict = {}
+
+        def fake_run(cmd, check=False, **kwargs):
+            if cmd[:2] == ["launchctl", "bootstrap"]:
+                # Snapshot what the plist looked like at bootstrap time.
+                bootstrap_seen_perms["chmod"] = list(chmod_calls)
+                bootstrap_seen_perms["chown"] = list(chown_calls)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        gateway_cli.launchd_install(system=True, run_as_user="alice")
+
+        assert (str(plist_path), 0o644) in chmod_calls
+        assert (str(plist_path), 0, 0) in chown_calls
+        # Both must have been applied BEFORE launchctl bootstrap saw the file.
+        assert bootstrap_seen_perms["chmod"], "chmod must precede bootstrap"
+        assert bootstrap_seen_perms["chown"], "chown must precede bootstrap"
+
+    def test_stale_refresh_reapplies_root_wheel_and_0644(
+        self, tmp_path, monkeypatch
+    ):
+        plist_path = tmp_path / "ai.hermes.daemon.plist"
+        plist_path.write_text("<plist>old</plist>", encoding="utf-8")
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_plist_path", lambda system=False: plist_path
+        )
+        monkeypatch.setattr(
+            gateway_cli, "launchd_plist_is_current", lambda system=False: False
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_read_launchd_run_as_user_from_plist",
+            lambda p: "alice",
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "generate_launchd_plist",
+            lambda system=False, run_as_user=None: "<plist>new</plist>",
+        )
+        monkeypatch.setattr(os, "geteuid", lambda: 0)
+        monkeypatch.setattr(gateway_cli.os, "geteuid", lambda: 0)
+
+        self._install_grp_stub(monkeypatch, wheel_gid=0)
+        chmod_calls, chown_calls = self._capture_perm_calls(monkeypatch)
+
+        order: list[str] = []
+
+        def fake_run(cmd, check=False, **kwargs):
+            if cmd[:2] == ["launchctl", "bootout"]:
+                order.append("bootout")
+            elif cmd[:2] == ["launchctl", "bootstrap"]:
+                order.append("bootstrap")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        assert gateway_cli.refresh_launchd_plist_if_needed(system=True) is True
+
+        assert (str(plist_path), 0o644) in chmod_calls
+        assert (str(plist_path), 0, 0) in chown_calls
+        # Refresh path must call bootout then bootstrap, both after perm fix.
+        assert order == ["bootout", "bootstrap"]
+
+    def test_current_system_plist_reapplies_root_wheel_and_0644_without_reload(
+        self, tmp_path, monkeypatch
+    ):
+        # Contents can be current while permissions drift (e.g. manual edit or
+        # previous buggy install). The refresh helper must repair perms even
+        # when it does not rewrite/reload the plist, so later start/bootstrap
+        # paths never present a bad /Library/LaunchDaemons plist to launchd.
+        plist_path = tmp_path / "ai.hermes.daemon.plist"
+        plist_path.write_text("<plist/>\n", encoding="utf-8")
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_plist_path", lambda system=False: plist_path
+        )
+        monkeypatch.setattr(
+            gateway_cli, "launchd_plist_is_current", lambda system=False: True
+        )
+        monkeypatch.setattr(os, "geteuid", lambda: 0)
+        monkeypatch.setattr(gateway_cli.os, "geteuid", lambda: 0)
+
+        self._install_grp_stub(monkeypatch, wheel_gid=0)
+        chmod_calls, chown_calls = self._capture_perm_calls(monkeypatch)
+        run_calls: list[list[str]] = []
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda cmd, check=False, **kwargs: run_calls.append(cmd)
+            or SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+
+        assert gateway_cli.refresh_launchd_plist_if_needed(system=True) is False
+
+        assert (str(plist_path), 0o644) in chmod_calls
+        assert (str(plist_path), 0, 0) in chown_calls
+        assert run_calls == []
+
+    def test_install_existing_current_system_plist_repairs_perms_before_return(
+        self, tmp_path, monkeypatch
+    ):
+        plist_path = tmp_path / "ai.hermes.daemon.plist"
+        plist_path.write_text("<plist/>\n", encoding="utf-8")
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_plist_path", lambda system=False: plist_path
+        )
+        monkeypatch.setattr(
+            gateway_cli, "launchd_plist_is_current", lambda system=False: True
+        )
+        monkeypatch.setattr(os, "geteuid", lambda: 0)
+        monkeypatch.setattr(gateway_cli.os, "geteuid", lambda: 0)
+
+        self._install_grp_stub(monkeypatch, wheel_gid=0)
+        chmod_calls, chown_calls = self._capture_perm_calls(monkeypatch)
+        run_calls: list[list[str]] = []
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda cmd, check=False, **kwargs: run_calls.append(cmd)
+            or SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+
+        gateway_cli.launchd_install(system=True, run_as_user="alice")
+
+        assert (str(plist_path), 0o644) in chmod_calls
+        assert (str(plist_path), 0, 0) in chown_calls
+        assert run_calls == []
+
+    def test_start_existing_current_system_plist_repairs_perms_before_kickstart(
+        self, tmp_path, monkeypatch
+    ):
+        plist_path = tmp_path / "ai.hermes.daemon.plist"
+        plist_path.write_text("<plist/>\n", encoding="utf-8")
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_plist_path", lambda system=False: plist_path
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_select_launchd_scope", lambda system=False: True
+        )
+        monkeypatch.setattr(
+            gateway_cli, "launchd_plist_is_current", lambda system=False: True
+        )
+        monkeypatch.setattr(os, "geteuid", lambda: 0)
+        monkeypatch.setattr(gateway_cli.os, "geteuid", lambda: 0)
+
+        self._install_grp_stub(monkeypatch, wheel_gid=0)
+        chmod_calls, chown_calls = self._capture_perm_calls(monkeypatch)
+        kickstart_seen_perms: dict = {}
+
+        def fake_run(cmd, check=False, **kwargs):
+            if cmd[:2] == ["launchctl", "kickstart"]:
+                kickstart_seen_perms["chmod"] = list(chmod_calls)
+                kickstart_seen_perms["chown"] = list(chown_calls)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        gateway_cli.launchd_start(system=True)
+
+        assert (str(plist_path), 0o644) in chmod_calls
+        assert (str(plist_path), 0, 0) in chown_calls
+        assert kickstart_seen_perms["chmod"], "chmod must precede kickstart"
+        assert kickstart_seen_perms["chown"], "chown must precede kickstart"
+
+    def test_restart_existing_current_system_plist_repairs_perms_before_bootstrap(
+        self, tmp_path, monkeypatch
+    ):
+        plist_path = tmp_path / "ai.hermes.daemon.plist"
+        plist_path.write_text("<plist/>\n", encoding="utf-8")
+        label = "ai.hermes.daemon"
+        domain = "system"
+        target = f"{domain}/{label}"
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_plist_path", lambda system=False: plist_path
+        )
+        monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda system=False: label)
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda system=False: domain)
+        monkeypatch.setattr(
+            gateway_cli, "_select_launchd_scope", lambda system=False: True
+        )
+        monkeypatch.setattr(
+            gateway_cli, "launchd_plist_is_current", lambda system=False: True
+        )
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+        monkeypatch.setattr(os, "geteuid", lambda: 0)
+        monkeypatch.setattr(gateway_cli.os, "geteuid", lambda: 0)
+
+        self._install_grp_stub(monkeypatch, wheel_gid=0)
+        chmod_calls, chown_calls = self._capture_perm_calls(monkeypatch)
+        bootstrap_seen_perms: dict = {}
+
+        def fake_run(cmd, check=False, **kwargs):
+            if cmd == ["launchctl", "kickstart", "-k", target]:
+                raise gateway_cli.subprocess.CalledProcessError(
+                    3, cmd, stderr="Could not find service"
+                )
+            if cmd[:2] == ["launchctl", "bootstrap"]:
+                bootstrap_seen_perms["chmod"] = list(chmod_calls)
+                bootstrap_seen_perms["chown"] = list(chown_calls)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        gateway_cli.launchd_restart(system=True)
+
+        assert (str(plist_path), 0o644) in chmod_calls
+        assert (str(plist_path), 0, 0) in chown_calls
+        assert bootstrap_seen_perms["chmod"], "chmod must precede bootstrap"
+        assert bootstrap_seen_perms["chown"], "chown must precede bootstrap"
+
+    def test_start_self_heal_sets_root_wheel_when_plist_missing(
+        self, tmp_path, monkeypatch
+    ):
+        plist_path = tmp_path / "ai.hermes.daemon.plist"
+        # Plist intentionally missing — exercises the self-heal branch.
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_plist_path", lambda system=False: plist_path
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_select_launchd_scope", lambda system=False: True
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "generate_launchd_plist",
+            lambda system=False, run_as_user=None: "<plist/>\n",
+        )
+        monkeypatch.setattr(os, "geteuid", lambda: 0)
+        monkeypatch.setattr(gateway_cli.os, "geteuid", lambda: 0)
+
+        self._install_grp_stub(monkeypatch, wheel_gid=0)
+        chmod_calls, chown_calls = self._capture_perm_calls(monkeypatch)
+
+        bootstrap_perms: dict = {}
+
+        def fake_run(cmd, check=False, **kwargs):
+            if cmd[:2] == ["launchctl", "bootstrap"]:
+                bootstrap_perms["chmod"] = list(chmod_calls)
+                bootstrap_perms["chown"] = list(chown_calls)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        gateway_cli.launchd_start(system=True)
+
+        assert (str(plist_path), 0o644) in chmod_calls
+        assert (str(plist_path), 0, 0) in chown_calls
+        assert bootstrap_perms["chmod"], "chmod must precede bootstrap"
+        assert bootstrap_perms["chown"], "chown must precede bootstrap"
+
+    def test_user_launchagent_install_does_not_chown_root_wheel(
+        self, tmp_path, monkeypatch
+    ):
+        # User-scope plist lives under ~/Library/LaunchAgents and must keep
+        # the user's own ownership — we must never call chown(_, 0, wheel)
+        # for non-system installs.
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_plist_path", lambda system=False: plist_path
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "generate_launchd_plist",
+            lambda system=False, run_as_user=None: "<plist/>\n",
+        )
+        # Even if we happen to be root, user-scope must not trigger root:wheel.
+        monkeypatch.setattr(os, "geteuid", lambda: 0)
+        monkeypatch.setattr(gateway_cli.os, "geteuid", lambda: 0)
+
+        self._install_grp_stub(monkeypatch, wheel_gid=0)
+        chmod_calls, chown_calls = self._capture_perm_calls(monkeypatch)
+
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda cmd, check=False, **kwargs: SimpleNamespace(
+                returncode=0, stdout="", stderr=""
+            ),
+        )
+
+        gateway_cli.launchd_install(system=False)
+
+        assert chown_calls == []
+        # No chmod against the user plist either — let the user's umask govern.
+        assert all(p != str(plist_path) for p, _mode in chmod_calls)
+
+    def test_perm_helper_skips_chown_when_wheel_group_missing(
+        self, tmp_path, monkeypatch
+    ):
+        # Test environments without a ``wheel`` group (common on Linux CI)
+        # must not blow up — chmod still happens, chown is silently skipped.
+        plist_path = tmp_path / "ai.hermes.daemon.plist"
+        plist_path.write_text("<plist/>\n", encoding="utf-8")
+        monkeypatch.setattr(os, "geteuid", lambda: 0)
+        monkeypatch.setattr(gateway_cli.os, "geteuid", lambda: 0)
+
+        import grp as real_grp
+
+        def fake_getgrnam(name):
+            raise KeyError(name)
+
+        monkeypatch.setattr(real_grp, "getgrnam", fake_getgrnam)
+
+        chmod_calls, chown_calls = self._capture_perm_calls(monkeypatch)
+
+        gateway_cli._enforce_system_launchd_plist_perms(plist_path)
+
+        assert (str(plist_path), 0o644) in chmod_calls
+        assert chown_calls == []
+
+    def test_perm_helper_skips_chown_when_not_root(
+        self, tmp_path, monkeypatch
+    ):
+        # Non-root callers (e.g. tests, plist drift checks) must not attempt
+        # chown — the bare chmod is harmless.
+        plist_path = tmp_path / "ai.hermes.daemon.plist"
+        plist_path.write_text("<plist/>\n", encoding="utf-8")
+        monkeypatch.setattr(gateway_cli.os, "geteuid", lambda: 501)
+
+        self._install_grp_stub(monkeypatch, wheel_gid=0)
+        chmod_calls, chown_calls = self._capture_perm_calls(monkeypatch)
+
+        gateway_cli._enforce_system_launchd_plist_perms(plist_path)
+
+        assert (str(plist_path), 0o644) in chmod_calls
+        assert chown_calls == []
