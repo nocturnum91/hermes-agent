@@ -3734,6 +3734,20 @@ def resolve_provider_client(
             return resolve_provider_client("openai-codex", model, async_mode)
         if provider == "xai-oauth":
             return resolve_provider_client("xai-oauth", model, async_mode)
+        if provider == "google-gemini-cli":
+            # Gemini CLI / Cloud Code Assist uses Google OAuth, not an API key.
+            # Its adapter exposes the same .chat.completions.create() surface
+            # as OpenAI clients, so text-only auxiliary tasks (compression,
+            # title generation, etc.) can use it directly when explicitly
+            # selected via auxiliary.<task>.provider.
+            from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+
+            final_model = _normalize_resolved_model(
+                model or "gemini-3-flash-preview", provider
+            )
+            client = GeminiCloudCodeClient()
+            return (_to_async_client(client, final_model, is_vision=is_vision)
+                    if async_mode else (client, final_model))
         # Other OAuth providers not directly supported
         logger.warning("resolve_provider_client: OAuth provider %s not "
                        "directly supported, try 'auto'", provider)
