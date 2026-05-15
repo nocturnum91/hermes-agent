@@ -84,6 +84,23 @@ class TestNormalizeAuxProvider:
         assert _normalize_aux_provider("copilot-acp-agent") == "copilot-acp"
 
 
+class TestGeminiCliAuxiliaryProvider:
+    def test_explicit_google_gemini_cli_returns_cloudcode_client(self):
+        fake_client = MagicMock()
+        with patch(
+            "agent.gemini_cloudcode_adapter.GeminiCloudCodeClient",
+            return_value=fake_client,
+        ) as mock_client:
+            client, model = resolve_provider_client(
+                "google-gemini-cli",
+                model="gemini-3-flash-preview",
+            )
+
+        assert client is fake_client
+        assert model == "gemini-3-flash-preview"
+        mock_client.assert_called_once_with()
+
+
 class TestReadCodexAccessToken:
     def test_valid_auth_store(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes"
